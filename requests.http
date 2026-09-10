@@ -1,0 +1,38 @@
+### Змінні оточення
+@baseUrl = http://localhost:3000
+
+### 1. GET запит з параметром :id
+GET {{baseUrl}}/123
+
+### 2. POST запит на створення користувача
+POST {{baseUrl}}/users
+Content-Type: application/json
+
+{
+  "name": "Dmytro",
+  "role": "developer"
+}
+
+### 3. POST запит test
+POST {{baseUrl}}/test
+Content-Type: application/json
+X-API-Key: 1231
+
+{
+  "name": "Dmytro",
+  "role": "developer"
+}
+
+### 4. GET запит з помилкою
+GET {{baseUrl}}/test-error
+
+
+### 5. GET запит з невідомим маршрутом
+GET {{baseUrl}}/unknown
+
+
+### 6. GET запит з невідомим маршрутом
+GET {{baseUrl}}/users/test1
+
+### 7. GET запит з невідомим маршрутом
+GET {{baseUrl}}/health

@@ -1,0 +1,29 @@
+{
+  "name": "docker-sandbox",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/dmyamster/robot_dreams-nodejs_pro_hw#readme",
+  "bugs": {
+    "url": "https://github.com/dmyamster/robot_dreams-nodejs_pro_hw/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmyamster/robot_dreams-nodejs_pro_hw.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "scripts": {
+    "start": "node index.ts",
+    "dev": "node --watch index.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2"
+  }
+}
