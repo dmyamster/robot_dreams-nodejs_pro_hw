@@ -17,13 +17,19 @@ FROM node:22-alpine AS runner
 
 WORKDIR /app
 
-ENV NODE_ENV=production
-
 COPY package*.json ./
 
-RUN npm ci --only=production
+RUN npm ci
+
+ENV NODE_ENV=production
 
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/tests ./tests
+COPY --from=builder /app/vitest.config.ts ./vitest.config.ts
+COPY --from=builder /app/src ./src
+COPY --from=builder /app/tsconfig.json ./tsconfig.json
+
+RUN chown -R node:node /app
 
 USER node
 
