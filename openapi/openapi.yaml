@@ -1,0 +1,418 @@
+openapi: 3.0.3
+info:
+  title: Paper Trading Broker API
+  description: >
+    API віртуального брокера для симуляції торгівлі акціями (Paper Trading).
+    Надає можливості перегляду фінансових інструментів, створення та виконання ордерів
+    із підтримкою cursor-пагінації, ідемпотентності та формату помилок RFC 7807 problem+json.
+  version: 1.0.0
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Локальний сервер розробки
+security: []
+paths:
+  /instruments:
+    get:
+      operationId: getInstruments
+      summary: Отримати список фінансових інструментів (акцій)
+      description: >
+        Повертає сторінку доступних акцій з використанням cursor-пагінації.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Максимальна кількість елементів на сторінці
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозорий токен для отримання наступної сторінки результатів
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Успішне отримання списку інструментів
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstrumentListResponse'
+        '400':
+          description: Невалідні параметри запиту
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Внутрішня помилка сервера
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /instruments/{symbol}:
+    get:
+      operationId: getInstrumentBySymbol
+      summary: Отримати детальну інформацію про акцію за тікером
+      description: Повертає актуальні дані конкретного фінансового інструменту (ціна в центах, сектор, статус торгів).
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          description: Біржовий тікер інструменту (наприклад, AAPL, TSLA)
+          schema:
+            type: string
+            pattern: '^[A-Z]{1,5}$'
+            example: AAPL
+      responses:
+        '200':
+          description: Інформація про інструмент знайдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockInstrument'
+        '400':
+          description: Невалідний формат тікера
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Інструмент не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Внутрішня помилка сервера
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /orders:
+    post:
+      operationId: createOrder
+      summary: Створити новий торговий ордер
+      description: >
+        Створює нову заявку на купівлю або продаж акцій. Операція вимагає обов'язковий заголовок
+        ідемпотентності Idempotency-Key.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >
+            Унікальний ключ ідемпотентності клієнта (UUID v4). Семантика повтору: той самий ключ
+            і те саме тіло повертають ту саму раніше створену відповідь без повторного списання коштів.
+            Той самий ключ з іншим тілом викликає помилку 422 Unprocessable Entity.
+          schema:
+            type: string
+            format: uuid
+            example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+      requestBody:
+        required: true
+        description: Дані для створення торгового ордера
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Ордер успішно створено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: Помилка валідації запиту (відсутнє обов'язкове поле або заголовок Idempotency-Key)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Семантична помилка (недостатньо коштів або колізія Idempotency-Key з іншим тілом)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Внутрішня помилка сервера
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+    get:
+      operationId: getOrders
+      summary: Отримати список ордерів користувача
+      description: Повертає список торгових ордерів поточного користувача з підтримкою cursor-пагінації.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Кількість ордерів для вибірки
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозорий токен для отримання наступної сторінки результатів
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Список ордерів успішно отримано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderListResponse'
+        '400':
+          description: Невалідні параметри запиту
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Внутрішня помилка сервера
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /orders/{id}:
+    get:
+      operationId: getOrderById
+      summary: Отримати інформацію про ордер за ідентифікатором
+      description: Повертає статус, параметри та деталі виконання конкретного торгового ордера.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Унікальний ідентифікатор ордера
+          schema:
+            type: string
+            format: uuid
+            example: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+      responses:
+        '200':
+          description: Ордер знайдено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: Невалідний формат ID ордера
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Ордер не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Внутрішня помилка сервера
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+components:
+  schemas:
+    StockInstrument:
+      type: object
+      required:
+        - symbol
+        - company_name
+        - current_price_cents
+        - sector
+        - trading_status
+      properties:
+        symbol:
+          type: string
+          example: AAPL
+        company_name:
+          type: string
+          example: Apple Inc.
+        current_price_cents:
+          type: integer
+          description: Ціна акції в цілих центах (наприклад, 22050 = $220.50)
+          example: 22050
+        sector:
+          type: string
+          example: Technology
+        trading_status:
+          type: string
+          enum: [ACTIVE, HALTED]
+          example: ACTIVE
+        logo_url:
+          type: string
+          format: uri
+          nullable: true
+          example: https://storage.example.com/logos/aapl.png
+
+    InstrumentListResponse:
+      type: object
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/StockInstrument'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Непрозорий токен наступної сторінки або null, якщо сторінок більше немає
+          example: "eyJpZCI6MTB9"
+
+    CreateOrderRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - symbol
+        - side
+        - type
+        - quantity
+      properties:
+        symbol:
+          type: string
+          pattern: '^[A-Z]{1,5}$'
+          example: AAPL
+        side:
+          type: string
+          enum: [BUY, SELL]
+          example: BUY
+        type:
+          type: string
+          enum: [MARKET, LIMIT]
+          example: MARKET
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          example: 10
+        limit_price_cents:
+          type: integer
+          minimum: 1
+          description: Лімітна ціна в центах для LIMIT ордерів (не обов'язкова для MARKET)
+          example: 22000
+
+    Order:
+      type: object
+      required:
+        - id
+        - account_id
+        - symbol
+        - side
+        - type
+        - quantity
+        - status
+        - total_cents
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+        account_id:
+          type: string
+          format: uuid
+          example: "b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22"
+        symbol:
+          type: string
+          example: AAPL
+        side:
+          type: string
+          enum: [BUY, SELL]
+          example: BUY
+        type:
+          type: string
+          enum: [MARKET, LIMIT]
+          example: MARKET
+        quantity:
+          type: integer
+          example: 10
+        limit_price_cents:
+          type: integer
+          nullable: true
+          example: 22000
+        execution_price_cents:
+          type: integer
+          nullable: true
+          example: 22050
+        fee_cents:
+          type: integer
+          nullable: true
+          example: 150
+        total_cents:
+          type: integer
+          description: Загальна сума ордера в центах
+          example: 220650
+        status:
+          type: string
+          enum: [PENDING, FILLED, CANCELLED, REJECTED]
+          example: FILLED
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-09-16T10:00:00Z"
+
+    OrderListResponse:
+      type: object
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Непрозорий токен наступної сторінки або null, якщо сторінок більше немає
+          example: null
+
+    Problem:
+      type: object
+      description: Схема помилки згідно з RFC 7807 (Problem Details for HTTP APIs)
+      required:
+        - type
+        - title
+        - status
+        - detail
+        - instance
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI типу помилки
+          example: https://api.broker.example.com/errors/bad-request
+        title:
+          type: string
+          description: Коротка назва помилки
+          example: Bad Request
+        status:
+          type: integer
+          description: HTTP-код помилки
+          example: 400
+        detail:
+          type: string
+          description: Пояснення, що саме пішло не так
+          example: "request/headers must have required property 'idempotency-key'"
+        instance:
+          type: string
+          description: Посилання на конкретний випадок помилки (URI запиту)
+          example: /api/v1/orders
