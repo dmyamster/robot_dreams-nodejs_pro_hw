@@ -1,0 +1,230 @@
+{
+  "consumer": {
+    "name": "PaperTradingFrontend"
+  },
+  "interactions": [
+    {
+      "description": "a request for an existing order by ID",
+      "providerStates": [
+        {
+          "name": "an order with ID a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 exists"
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+      },
+      "response": {
+        "body": {
+          "account_id": "b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22",
+          "created_at": "2026-09-16T10:00:00Z",
+          "execution_price_cents": 22050,
+          "fee_cents": 150,
+          "id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+          "limit_price_cents": null,
+          "quantity": 10,
+          "side": "BUY",
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "total_cents": 220650,
+          "type": "MARKET"
+        },
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "matchingRules": {
+          "body": {
+            "$.account_id": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                }
+              ]
+            },
+            "$.created_at": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.execution_price_cents": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.fee_cents": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.id": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                }
+              ]
+            },
+            "$.quantity": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.side": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "^(BUY|SELL)$"
+                }
+              ]
+            },
+            "$.status": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "^(PENDING|FILLED|CANCELLED|REJECTED)$"
+                }
+              ]
+            },
+            "$.symbol": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.total_cents": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.type": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "^(MARKET|LIMIT)$"
+                }
+              ]
+            }
+          }
+        },
+        "status": 200
+      }
+    },
+    {
+      "description": "a request for instrument by symbol",
+      "providerStates": [
+        {
+          "name": "an instrument with symbol AAPL exists"
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/instruments/AAPL"
+      },
+      "response": {
+        "body": {
+          "company_name": "Apple Inc.",
+          "current_price_cents": 22050,
+          "logo_url": "https://storage.example.com/logos/aapl.png",
+          "sector": "Technology",
+          "symbol": "AAPL",
+          "trading_status": "ACTIVE"
+        },
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "matchingRules": {
+          "body": {
+            "$.company_name": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.current_price_cents": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.logo_url": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.sector": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.symbol": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.trading_status": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "^(ACTIVE|HALTED)$"
+                }
+              ]
+            }
+          }
+        },
+        "status": 200
+      }
+    }
+  ],
+  "metadata": {
+    "pact-js": {
+      "version": "17.1.4"
+    },
+    "pactRust": {
+      "ffi": "0.5.8",
+      "models": "1.3.16"
+    },
+    "pactSpecification": {
+      "version": "3.0.0"
+    }
+  },
+  "provider": {
+    "name": "PaperTradingBrokerApi"
+  }
+}

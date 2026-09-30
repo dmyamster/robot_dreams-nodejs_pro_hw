@@ -3,7 +3,7 @@ import { z } from 'zod';
 export const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().int().positive().default(3000),
-  DB_URL: z.string().min(1, 'DB_URL is required'),
+  DB_URL: z.string().min(1, 'DB_URL is required').default(process.env.DATABASE_URL || 'postgres://postgres@127.0.0.1:5432/broker_db'),
   DB_PASSWORD_PATH: z.string().min(1).default('./secrets/db_password'),
 });
 

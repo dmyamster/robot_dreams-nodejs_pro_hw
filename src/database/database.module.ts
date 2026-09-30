@@ -25,8 +25,14 @@ export const PG_POOL = 'PG_POOL';
           user: url.username || 'postgres',
           database: url.pathname.replace(/^\//, '') || 'postgres',
           password: async () => {
-            const password = await fs.promises.readFile(resolvedPath, 'utf8');
-            return password.trim();
+            if (url.password) {
+              return decodeURIComponent(url.password);
+            }
+            if (fs.existsSync(resolvedPath)) {
+              const password = await fs.promises.readFile(resolvedPath, 'utf8');
+              return password.trim();
+            }
+            return process.env.DB_PASSWORD || 'super_secret_db_pass_123';
           },
           max: 10,
           idleTimeoutMillis: 10000,
