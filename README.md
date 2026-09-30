@@ -157,12 +157,12 @@ npm run start:prod
 
 Усі змінні суворо описані у схемі `src/config/env.schema.ts`:
 
-| Змінна | Тип | Обовʼязкова / Дефолт | Опис |
-| --- | --- | --- | --- |
-| `NODE_ENV` | `enum('development', 'production', 'test')` | Дефолт: `development` | Режим оточення застосунку |
-| `PORT` | `number` (z.coerce) | Дефолт: `3000` | TCP-порт HTTP-сервера |
-| `DB_URL` | `string` | **Обовʼязкова** | URL підключення до PostgreSQL (без секретів) |
-| `DB_PASSWORD_PATH` | `string` | Дефолт: `./secrets/db_password` | Шлях до файлу із паролем до БД |
+| Змінна | Тип | Обовʼязкова / Дефолт | Джерело | Опис |
+| --- | --- | --- | --- | --- |
+| `NODE_ENV` | `enum('development', 'production', 'test')` | Дефолт: `development` | Оточення (`.env` / CLI) | Режим оточення застосунку |
+| `PORT` | `number` (z.coerce) | Дефолт: `3000` | Оточення (`.env` / CLI) | TCP-порт HTTP-сервера |
+| `DB_URL` | `string` | **Обовʼязкова** | **Сховище** (Infisical / secret store) | URL підключення до PostgreSQL (без секретів) |
+| `DB_PASSWORD_PATH` | `string` | Дефолт: `./secrets/db_password` | Локальний файл / volume mount | Шлях до файлу із паролем до БД |
 
 > **Секрети поза Git та Docker-образом**: Файл `.env` та каталог `secrets/` знаходяться у `.gitignore` та `.dockerignore`. У Git комітиться виключно файл-контракт `.env.example`.
 
@@ -222,6 +222,83 @@ npm run start:dev
 
 ---
 
+## ДЗ #12: Дата-шар під навантаженням (Схема, Seed, Індекси, Пошук)
+
+У цьому завданні реалізовано та протестовано продуктивний дата-шар PostgreSQL для домену **Paper Trading Broker API**:
+- Схема (`db/schema.sql`): 5 таблиць (`users`, `accounts`, `products`, `orders`, `positions`), 5 звʼязків `FOREIGN KEY`, суворі типи (`NUMERIC(18, 4)` для фінансів, `TIMESTAMPTZ`), генерована колонка `search_vector tsvector GENERATED ALWAYS AS (...) STORED` та сумісний view `instruments`.
+- Обсяг даних (`db/seed.sql`): 150,000 рядків у головній таблиці `orders` та 120,000 рядків у каталозі `products`. Реалістичний перекіс статусів: 80% `FILLED`, 15% `CANCELLED`, 4% `REJECTED`, 1% `PENDING`. Текстові описи українською мовою та завершальний `VACUUM (ANALYZE);`.
+- Оптимізація (`db/indexes.sql`): композитний B-Tree, partial index для статусу `PENDING`, expression index для `lower(symbol)` та GIN індекс для `search_vector`.
+- Звіт (`db/OPTIMIZATIONS.md`): повні виводи `EXPLAIN (ANALYZE, BUFFERS)` до та після, аналіз планів і розділ дослідження морфології.
+
+### Швидкий запуск стенда (свіжий клон)
+
+**Підняти базу:**
+```bash
+docker compose up -d --wait
+```
+
+**Підключитись:**
+```bash
+docker compose exec -T postgres psql -U postgres -d broker_db
+```
+
+*(Або через локальний клієнт psql: `PGPASSWORD=super_secret_db_pass_123 psql -h localhost -p 5432 -U postgres -d broker_db`)*
+
+### Назви таблиць для перевірки обсягу (≥ 100 000 рядків)
+
+- **Головна таблиця:** `orders` (150,000 рядків)
+- **Таблиця каталогу та пошуку (q4):** `products` (120,000 рядків, доступна також через view `instruments`)
+
+### Відтворення повного циклу перевірки
+
+```bash
+# 1. Застосування схеми (5 таблиць, 5 FK, generated search_vector, view)
+docker compose exec -T postgres psql -U postgres -d broker_db -f db/schema.sql
+
+# 2. Наповнення даними (150k orders, 120k products, перекіс статусів + VACUUM ANALYZE)
+docker compose exec -T postgres psql -U postgres -d broker_db -f db/seed.sql
+
+# 3. EXPLAIN (ANALYZE, BUFFERS) ДО створення індексів (усі 4 запити містять Seq Scan)
+docker compose exec -T postgres psql -U postgres -d broker_db -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q1.sql)"
+docker compose exec -T postgres psql -U postgres -d broker_db -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q2.sql)"
+docker compose exec -T postgres psql -U postgres -d broker_db -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q3.sql)"
+docker compose exec -T postgres psql -U postgres -d broker_db -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q4.sql)"
+
+# 4. Створення індексів та оновлення статистики
+docker compose exec -T postgres psql -U postgres -d broker_db -f db/indexes.sql
+docker compose exec -T postgres psql -U postgres -d broker_db -c "ANALYZE;"
+
+# 5. EXPLAIN (ANALYZE, BUFFERS) ПІСЛЯ створення індексів (індексні скани, жодного Seq Scan)
+docker compose exec -T postgres psql -U postgres -d broker_db -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q1.sql)"
+docker compose exec -T postgres psql -U postgres -d broker_db -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q2.sql)"
+docker compose exec -T postgres psql -U postgres -d broker_db -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q3.sql)"
+docker compose exec -T postgres psql -U postgres -d broker_db -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q4.sql)"
+```
+
+### Команди перевірки Acceptance Criteria
+
+```bash
+# Схема та Foreign Keys (>= 3):
+docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT count(*) FROM information_schema.table_constraints WHERE constraint_type='FOREIGN KEY' AND table_schema='public';"
+
+# Обсяг головної таблиці orders (>= 100000):
+docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT count(*) FROM orders;"
+
+# Обсяг таблиці пошуку products (>= 100000):
+docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT count(*) FROM products;"
+
+# Перевірка на відсутність мертвих (невикористаних) індексів (порожній вивід):
+docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT indexrelname FROM pg_stat_user_indexes WHERE schemaname='public' AND idx_scan = 0 AND indexrelid NOT IN (SELECT conindid FROM pg_constraint WHERE conindid <> 0);"
+
+# Наявність partial або expression індексу (>= 1):
+docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexdef NOT ILIKE '%USING gin%' AND (indexdef ILIKE '% WHERE %' OR indexdef ~ '\((\w+)\(');"
+
+# GIN індекс за tsvector (>= 1):
+docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam JOIN pg_opclass o ON o.oid=i.indclass[0] WHERE am.amname='gin' AND o.opcintype='tsvector'::regtype;"
+```
+
+---
+
 ## Журнал рішень
 
 Рішення змінилось — **не переписуй розділи вище**. Додай запис сюди.
@@ -231,5 +308,6 @@ npm run start:dev
 - **2026-09-16 (ДЗ #0)**: Обрано домен **Paper Trading Broker API** з 5 сутностями (`User`, `Account`, `StockInstrument`, `Order`, `Position`). Зафіксовано архітектурні рішення (NestJS, PostgreSQL, RabbitMQ, Redis, K8s).
 - **2026-09-16 (ДЗ #9)**: Спроєктовано контракт `openapi/openapi.yaml` (OpenAPI 3.0.3) для ресурсів `/instruments` та `/orders`. Обрано **Варіант Б** контрактної верифікації, реалізований на **NestJS + TypeScript** з використанням `express-openapi-validator` (`validateRequests: true`, `validateResponses: true`) та `ProblemExceptionFilter` (RFC 7807 `application/problem+json`). Реалізовано повну семантику `Idempotency-Key` із заголовком `Idempotency-Replay: true`.
 - **2026-09-28 (ДЗ #11 / ДЗ #2 курсового проєкту)**: Наведено лад у конфігурації. Реалізовано єдину Zod-схему env (`src/config/env.schema.ts`) із fail-fast валідацією при старті через `ConfigModule.forRoot`, прямі звернення до `process.env` замінено на типізований `ConfigService<Env, true>`. Додано контракт `.env.example` та валідатор `scripts/check-env-example.mjs` (`npm run check:env`). Секрети винесено з Git (`.gitignore`) та шарів Docker-образу (`.dockerignore`, `Dockerfile`). Реалізовано ротацію пароля PostgreSQL без рестарту сервісу через `password: () => readFile()` у `pg.Pool`, обробку помилок завершення з'єднань пулу, скрипт `rotate.sh` та перевірочний ендпоінт `/health`.
+- **2026-09-29 (ДЗ #12 / ДЗ #3 курсового проєкту)**: Спроєктовано та реалізовано дата-шар PostgreSQL для Paper Trading Broker API. Розроблено схему (`db/schema.sql` на 5 сутностей: `users`, `accounts`, `products`/`instruments`, `orders`, `positions` із 5 зовнішніми ключами, фінансовими типами `NUMERIC(18, 4)` та збереженою генерованою колонкою `search_vector tsvector STORED`). Написано seed-скрипт (`db/seed.sql`) з наповненням 150,000 ордерів та 120,000 фінансових інструментів українською мовою з реалістичними перекошеними розподілами та фінішним `VACUUM (ANALYZE);`. Підготовлено 4 повільні запити (`db/queries/q1..q4.sql`) та оптимізуючий набір індексів (`db/indexes.sql`: композитний B-Tree `(account_id, created_at DESC)`, partial index `WHERE status = 'PENDING'`, expression index `(lower(symbol))` та FTS GIN індекс на `search_vector`). Складено детальний звіт `db/OPTIMIZATIONS.md` з вимірами `EXPLAIN (ANALYZE, BUFFERS)` до та після (десятки й сотні разів прискорення, повне виключення Seq Scan, відсутність мертвих індексів) і дослідженням специфіки морфології української мови у PostgreSQL.
 
 
