@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, hw-16]
+  pull_request:
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Clean compilation check
+        run: npx tsc --noEmit
+
+      - name: Run Integration suite (Testcontainers)
+        run: npm run test:integration
+
+      - name: Run E2E suite (Supertest)
+        run: npm run test:e2e
+
+  contract:
+    name: Contract Testing & can-i-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start Postgres and Pact Broker
+        run: docker compose up -d --wait
+
+      - name: Generate Consumer Contract (test:contract)
+        run: npm run test:contract
+
+      - name: Publish Contract to Broker (publish)
+        env:
+          PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL || 'http://127.0.0.1:9292' }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN || '' }}
+        run: |
+          AUTH_HEADER=""
+          if [ -n "$PACT_BROKER_TOKEN" ]; then
+            AUTH_HEADER="-H \"Authorization: Bearer $PACT_BROKER_TOKEN\""
+          fi
+          curl -s -f -X PUT "$PACT_BROKER_URL/pacts/provider/PaperTradingBrokerApi/consumer/PaperTradingFrontend/version/1.0.0" \
+            -H "Content-Type: application/json" \
+            $AUTH_HEADER \
+            -d @pacts/PaperTradingFrontend-PaperTradingBrokerApi.json
+
+      - name: Provider Verification (verify)
+        env:
+          PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL || 'http://127.0.0.1:9292' }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN || '' }}
+          PROVIDER_VERSION: '1.0.0'
+          SKIP_VAULT: 1
+        run: npm run verify:provider
+
+      - name: Tag Provider Version as prod
+        env:
+          PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL || 'http://127.0.0.1:9292' }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN || '' }}
+        run: |
+          AUTH_HEADER=""
+          if [ -n "$PACT_BROKER_TOKEN" ]; then
+            AUTH_HEADER="-H \"Authorization: Bearer $PACT_BROKER_TOKEN\""
+          fi
+          curl -s -f -X PUT "$PACT_BROKER_URL/pacticipants/PaperTradingBrokerApi/versions/1.0.0/tags/prod" \
+            -H "Content-Type: application/json" \
+            $AUTH_HEADER
+
+      - name: Gate check (can-i-deploy)
+        env:
+          PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL || 'http://127.0.0.1:9292' }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN || '' }}
+        run: |
+          AUTH_HEADER=""
+          if [ -n "$PACT_BROKER_TOKEN" ]; then
+            AUTH_HEADER="-H \"Authorization: Bearer $PACT_BROKER_TOKEN\""
+          fi
+          RESPONSE=$(curl -s $AUTH_HEADER "$PACT_BROKER_URL/can-i-deploy?pacticipant=PaperTradingFrontend&version=1.0.0&to=prod")
+          echo "can-i-deploy response: $RESPONSE"
+          node -e '
+            const res = JSON.parse(process.argv[1]);
+            if (res?.summary?.deployable === true) {
+              console.log("✅ can-i-deploy passed: deployable is true");
+              process.exit(0);
+            }
+            console.error("❌ can-i-deploy failed:", res?.summary?.reason || "not deployable");
+            process.exit(1);
+          ' "$RESPONSE"

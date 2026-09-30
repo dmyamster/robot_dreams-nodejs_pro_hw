@@ -38,5 +38,25 @@ services:
       retries: 5
       start_period: 3s
 
+  pact-broker:
+    image: pactfoundation/pact-broker:latest
+    container_name: broker_pact_broker
+    restart: always
+    ports:
+      - "9292:9292"
+    environment:
+      PACT_BROKER_DATABASE_URL: "postgres://postgres:super_secret_db_pass_123@postgres:5432/pact_broker"
+      PACT_BROKER_LOG_LEVEL: "INFO"
+      PACT_BROKER_ALLOW_OVERWRITE_OF_CONTRACT: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9292/diagnostic/status/heartbeat || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
 volumes:
   postgres_data:

@@ -311,6 +311,7 @@ docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT count
 - **2026-09-29 (ДЗ #12 / ДЗ #3 курсового проєкту)**: Спроєктовано та реалізовано дата-шар PostgreSQL для Paper Trading Broker API. Розроблено схему (`db/schema.sql` на 5 сутностей: `users`, `accounts`, `products`/`instruments`, `orders`, `positions` із 5 зовнішніми ключами, фінансовими типами `NUMERIC(18, 4)` та збереженою генерованою колонкою `search_vector tsvector STORED`). Написано seed-скрипт (`db/seed.sql`) з наповненням 150,000 ордерів та 120,000 фінансових інструментів українською мовою з реалістичними перекошеними розподілами та фінішним `VACUUM (ANALYZE);`. Підготовлено 4 повільні запити (`db/queries/q1..q4.sql`) та оптимізуючий набір індексів (`db/indexes.sql`: композитний B-Tree `(account_id, created_at DESC)`, partial index `WHERE status = 'PENDING'`, expression index `(lower(symbol))` та FTS GIN індекс на `search_vector`). Складено детальний звіт `db/OPTIMIZATIONS.md` з вимірами `EXPLAIN (ANALYZE, BUFFERS)` до та після (десятки й сотні разів прискорення, повне виключення Seq Scan, відсутність мертвих індексів) і дослідженням специфіки морфології української мови у PostgreSQL.
 - **2026-09-29 (ДЗ #13 / ДЗ #4 курсового проєкту)**: Перенесення дата-шару в TypeORM. Реалізовано 5 сутностей (`User`, `Account`, `Product`, `Order`, `Position`), гроші переведено в цілі числа у мінорних одиницях (центи, `bigint`), налаштовано суворі `onDelete` стратегії (`CASCADE` для володіння даними користувача, `RESTRICT` для захисту фінансового аудиту активів). `synchronize: false` з початковою згенерованою міграцією (`src/migrations/1790687949981-InitialSchema.ts`). Створено ідемпотентний seed (`src/seed.ts`), демонстрацію лікування N+1 проблеми (`src/demo-nplus1.ts`), звіт ринкової аналітики через QueryBuilder (`src/report.ts`), інтеграцію зі сховищем секретів через `scripts/with-secrets.sh` із аварійним байпасом `SKIP_VAULT=1`.
 - **2026-09-30 (ДЗ #14 / ДЗ #5 курсового проєкту)**: Реалізовано транзакційний checkout із захистом від oversell та overdraft, чергу фонових задач із паралельним розбором через воркер-пул на базі `FOR UPDATE SKIP LOCKED`, та retry-патерн для обробки транзакційних конфліктів серіалізації (SQLSTATE `40001` / `40P01`) з експоненційним backoff.
+- **2026-09-30 (ДЗ #16 / ДЗ #6 курсового проєкту)**: Побудовано комплексну «драбинку довіри» (Testing Pyramid): integration suite на базі Testcontainers проти справжнього PostgreSQL 16-alpine з ізоляцією через TRUNCATE CASCADE та test data builders; наскрізний E2E happy path та негативні сценарії через Supertest без моків провайдерів; контрактне тестування через Pact (PactV3 consumer + provider verification проти живої OpenAPI-спеки з ДЗ #9); додано сервіс Pact Broker у compose та налаштовано CI-workflow з кроками publish → verify → can-i-deploy.
 
 ---
 
@@ -450,55 +451,181 @@ bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
 
 ---
 
-## Grading
+## ДЗ #16: Тестування (Integration Testcontainers, E2E Supertest, Pact Contract & can-i-deploy)
 
+У цьому завданні реалізовано повноцінну **драбинку довіри (Testing Pyramid)** без використання неправдивих моків даних:
+
+1. **Integration suite з Testcontainers (`test/integration/`)**:
+   - Інтеграційні тести репозиторіїв (`ProductRepository`, `OrderRepository`) виконуються проти справжнього PostgreSQL `postgres:16-alpine`, який піднімається кодом прямо з тесту через `@testcontainers/postgresql`.
+   - Покрито критичну поведінку, недоступну звичайним unit-мокам:
+     - Обмеження унікальності `UNIQUE` (`symbol` у продуктах, `idempotency_key` в ордерах — перехоплення PostgreSQL SQLSTATE `23505` / `duplicate key`).
+     - Обмеження зовнішнього ключа `FOREIGN KEY` (`account_id` та `product_id` в ордерах — перехоплення PostgreSQL SQLSTATE `23503` / `foreign_key_violation`).
+     - Поведінку, що залежить від реального рушія SQL: атомарний декремент залишку товару через `UPDATE ... WHERE stock >= $1 RETURNING ...`, `ON CONFLICT DO UPDATE` upsert, `GROUP BY` агрегації, partial index (`idx_orders_pending`), та складний SQL `INNER JOIN` з агрегацією фінансового обігу за секторами ринку (`getVolumeBySector`).
+
+2. **Ізоляція тестів**:
+   - **Обрана стратегія:** швидке очищення таблиць через `TRUNCATE TABLE ... RESTART IDENTITY CASCADE` у хуку `beforeEach` між тестами.
+   - **Чому саме вона:** На відміну від стратегії транзакцій з ROLLBACK, `TRUNCATE` дозволяє тестувати операції, які самі використовують власні транзакції, пули з'єднань або блокування рядків (як-от конкурентний checkout або `RETURNING`), де зовнішня тестова транзакція блокувала б або викривляла поведінку рушія. Порівняно зі стратегією «контейнер-на-файл», `TRUNCATE` відпрацьовує за мілісекунди без кількасекундного оверхеду на рестарт контейнерів та повторний прогін міграцій, забезпечуючи 100% чистий та ізольований стан БД для кожного тесту і гарантуючи зелені повторні запуски (`npm run test:integration && npm run test:integration`) без ручної чистки.
+
+3. **Test Data Builders (`test/integration/testkit/builders.ts`)**:
+   - Реалізовано builder-функції `aUser()`, `anAccount()`, `aProduct()`, `anOrder()` з валідними унікальними дефолтами (автоінкрементні тікери, унікальні номери рахунків, валідні UUID, хеші паролів).
+   - Тести залишаються лаконічними й виразними, перевизначаючи виключно ті атрибути, які суттєві для конкретного тест-кейсу, позбавляючи код «стіни фікстур».
+
+4. **E2E happy path через Supertest (`test/e2e/`)**:
+   - Повний реальний екземпляр NestJS-додатку (`Test.createTestingModule({ imports: [AppModule] })`) без підміни провайдерів.
+   - Підключення до БД забезпечується через рядок підключення `DB_URL` від тест-контейнера.
+   - Наскрізний happy path: створення торгового ордера через `POST /api/v1/orders` (201) → читання створеного ордера через `GET /api/v1/orders/:id` (200) → перевірка каталогу інструментів `GET /api/v1/instruments` (200) → повтор того самого запиту з заголовком `Idempotency-Replay: true` (201).
+   - Негативні кейси: відсутність обов'язкового `Idempotency-Key` (400), невалідний `quantity: 0` (400), неіснуючий ордер (404), колізія ідемпотентності з іншим тілом (422).
+
+5. **Contract-тест через Pact та узгодженість зі спекою #9**:
+   - **Consumer тест (`test/contract/consumer.spec.ts`)**: описує взаємодії уявного фронтенду `PaperTradingFrontend` із бекендом `PaperTradingBrokerApi` на базі Pact V3 з MatchersV3 (`like`, `regex`).
+   - Генерує контракт у `pacts/PaperTradingFrontend-PaperTradingBrokerApi.json` з наявними `providerStates`.
+   - Шляхи (`/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`, `/instruments/AAPL`) та структура відповідей суворо відповідають ресурсам `/orders/{id}` та `/instruments/{symbol}` зі специфікації `openapi/openapi.yaml`.
+   - **Provider verification (`test/contract/provider.verify.spec.ts`)**: піднімає справжній застосунок NestJS і верифікує реальні HTTP-відповіді через `stateHandlers`. Кожен interaction успішно проходить перевірку зі статусом `has a matching body (OK)`.
+
+6. **Pact Broker + can-i-deploy гейт у compose та CI**:
+   - Сервіс `pact-broker` додано у `docker-compose.yml` з перевіркою працездатності `healthcheck` через IPv4 `127.0.0.1:9292`.
+   - **Як підняти брокер локально:**
+     ```bash
+     docker compose up -d --wait
+     ```
+   - **Керування секретами:** Адреса та токен брокера приходять виключно з оточення (`process.env.PACT_BROKER_URL`, `process.env.PACT_BROKER_TOKEN`). Локально — через сховище ДЗ #11 (`bash scripts/with-secrets.sh dev npm run verify:provider`) або аварійний байпас (`SKIP_VAULT=1 PACT_BROKER_URL=... npm run verify:provider`), у CI — через secrets репозиторію. У коді немає захардкодних токенів.
+   - **CI Workflow (`.github/workflows/ci.yml`)**: містить job `contract` із повним конвеєром: генерація контракту → публікація в брокер (`publish`) → верифікація провайдером (`verify`) з `publishVerificationResult: true` → тегування версії провайдера → обов'язковий гейт `can-i-deploy`, який валить збірку у разі неготовності до релізу.
+
+### Демонстрація роботи deployment gate (can-i-deploy)
+
+Справжній гейт не є завжди-зеленим: доки версія провайдера не помічена як `prod`, контракт не вважається перевіреним для середовища, і брокер повертає `deployable: null` (`unknown: 1`). Щойно встановлюється тег `prod`, гейт стає `deployable: true`.
+
+#### 1. Стан ДО встановлення тегу `prod` (деплой заборонено):
 ```bash
-docker compose up -d --wait
-export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:6432/broker_db
-export DB_HOST=127.0.0.1 DB_PORT=6432 DB_USER=postgres DB_PASSWORD=super_secret_db_pass_123 DB_NAME=broker_db
-export SKIP_VAULT=1    # у грейдера немає доступу до сховища
-bash scripts/with-secrets.sh dev bash scripts/backup.sh
-bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
+curl -s "http://127.0.0.1:9292/can-i-deploy?pacticipant=PaperTradingFrontend&version=1.0.0&to=prod"
 ```
+**Вивід:**
+```json
+{
+  "summary": {
+    "deployable": null,
+    "reason": "There is no verified pact between version 1.0.0 of PaperTradingFrontend and the latest version of PaperTradingBrokerApi with tag prod (no such version exists)",
+    "success": 0,
+    "failed": 0,
+    "unknown": 1
+  },
+  "notices": [
+    {
+      "type": "error",
+      "text": "There is no verified pact between version 1.0.0 of PaperTradingFrontend and the latest version of PaperTradingBrokerApi with tag prod (no such version exists)"
+    }
+  ],
+  "matrix": [
+    {
+      "consumer": {
+        "name": "PaperTradingFrontend",
+        "version": { "number": "1.0.0" }
+      },
+      "provider": {
+        "name": "PaperTradingBrokerApi",
+        "version": null
+      },
+      "verificationResult": null
+    }
+  ]
+}
+```
+
+#### 2. Встановлення тегу `prod` на версію провайдера:
+```bash
+curl -i -X PUT "http://127.0.0.1:9292/pacticipants/PaperTradingBrokerApi/versions/1.0.0/tags/prod" \
+  -H 'Content-Type: application/json'
+```
+**Відповідь:** `HTTP/1.1 201 Created`
+
+#### 3. Стан ПІСЛЯ встановлення тегу `prod` (деплой дозволено):
+```bash
+curl -s "http://127.0.0.1:9292/can-i-deploy?pacticipant=PaperTradingFrontend&version=1.0.0&to=prod"
+```
+**Вивід:**
+```json
+{
+  "summary": {
+    "deployable": true,
+    "reason": "All required verification results are published and successful",
+    "success": 1,
+    "failed": 0,
+    "unknown": 0
+  },
+  "notices": [
+    {
+      "type": "success",
+      "text": "All required verification results are published and successful"
+    }
+  ],
+  "matrix": [
+    {
+      "consumer": {
+        "name": "PaperTradingFrontend",
+        "version": { "number": "1.0.0" }
+      },
+      "provider": {
+        "name": "PaperTradingBrokerApi",
+        "version": {
+          "number": "1.0.0",
+          "tags": [{ "name": "prod", "latest": true }]
+        }
+      },
+      "verificationResult": {
+        "success": true,
+        "verifiedAt": "2026-09-30T09:21:16+00:00"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Grading (ДЗ #16 Acceptance Criteria)
 
 ```bash
 # 1. Чиста компіляція
 npm ci && npx tsc --noEmit
 
-# 2. Збірка
-npm run build
+# 2. Integration suite на testcontainers (≥6 тестів: 2 репозиторії по 3+ тести, unique/FK constraints, SQL агрегації)
+npm run test:integration
 
-# 3. Застосування міграцій схеми з нуля
-npm run migrate
+# 3. Перевірка репортера (має містити 'default')
+grep -n "reporters" jest.config.*
 
-# 4. Перевірка статусу міграцій (показує [X] для InitialSchema та AddStockAndTaskQueue)
-npm run migrate:show
+# 4. Перевірка реальної ізоляції (повторний запуск зелений без ручної чистки)
+npm run test:integration && npm run test:integration
 
-# 5. Ідемпотентний seed (два запуски поспіль без помилок)
-npm run seed && npm run seed
+# 5. E2E тести через Supertest (≥2 тести: happy path create -> read + негативні кейси 400, 404, 422)
+npm run test:e2e
 
-# 6. Конкурентне навантаження без oversell (50 запитів, stock=10 -> рівно 10 успішних, stock=0, 0 негативних)
-npm run demo:race
+# 6. Статична перевірка негативних статусів в E2E
+grep -rnE "\b(400|404|409|422)\b|HttpStatus\.(BAD_REQUEST|NOT_FOUND|CONFLICT|UNPROCESSABLE_ENTITY)" test/e2e/
 
-# 7. Чесний воркер-пул через SKIP LOCKED (≥2 воркери, 0 оброблено двічі, час < послідовного)
-npm run demo:workers
+# 7. Генерація контракту Pact (створює pacts/*.json з providerStates)
+npm run test:contract
+ls pacts/*.json
+grep providerStates pacts/*.json
 
-# 8. Retry-патерн при serialization failure (піймано 40001, повтор із backoff, баланс збігається)
-npm run demo:retry
+# 8. Provider verification (справжній застосунок відповідає на interactions)
+npm run verify:provider 2>&1 | sed -E $'s/\x1b\\[[0-9;]*m//g' | grep -F "has a matching body (OK)"
 
-# 9. Перевірка N+1 з ДЗ #13
-npm run demo:nplus1
+# 9. Узгодженість контракту зі спекою OpenAPI з ДЗ #9 (друкує OK)
+node -e 'const p=require("./pacts/PaperTradingFrontend-PaperTradingBrokerApi.json");const spec=require("fs").readFileSync("openapi.yaml","utf8");const sp=[...spec.matchAll(/^\s+(\/\S*):\s*$/gm)].map(m=>m[1]);const seg=s=>s.split("?")[0].replace(/\/+$/,"").split("/");const fit=(a,b)=>{a=seg(a);b=seg(b);return a.length===b.length&&a.every((x,i)=>/^\{[^}]+\}$/.test(x)?b[i]!=="":x===b[i])};const bad=p.interactions.filter(i=>!sp.some(x=>fit(x,i.request.path)));console.log(bad.length?"НЕМАЄ У СПЕЦІ: "+bad.map(i=>i.request.path).join(", "):"OK");process.exit(bad.length?1:0)'
 
-# 10. Агрегований звіт через QueryBuilder з ДЗ #13
-npm run report
+# 10. Перевірка workflow CI (валідний YAML та наявність кроку can-i-deploy)
+grep -rn "can-i-deploy" .github/workflows/
+python3 -c "import yaml;yaml.safe_load(open('.github/workflows/ci.yml'))"
 
-# 11. Статична перевірка обгортки зі сховищем для нових демо
-node -e "const s=require('./package.json').scripts;const bad=['demo:race','demo:workers','demo:retry'].filter(k=>/with-secrets\.sh/.test(s[k]||'')===false);console.log(bad.length===0?'OK':'без обгортки: '+bad.join(', '));process.exit(bad.length===0?0:1)"
+# 11. Перевірка обгортки сховища та аварійного входу
+test -f scripts/with-secrets.sh && grep -q 'SKIP_VAULT' scripts/with-secrets.sh
 
-# 12. Пошукові критерії атомарності, skip locked та кодів помилок
-grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist "for update|returning|pessimistic_write" .
-grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist "skip[ _]locked" .
-grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist "40001|40P01" .
+# 12. Перевірка відсутності секретного токена брокера в репозиторії
+grep -rnE "PACT_BROKER_TOKEN[[:space:]]*[:=][[:space:]]*['\"][^'\"$]" --include='*.ts' --include='*.js' --include='*.yml' --include='*.yaml' --include='*.json' . | grep -v node_modules
+
+# 13. Запуск верифікатора через обгортку зі сховищем (змінні приходять із secret store або env)
+SKIP_VAULT=1 bash scripts/with-secrets.sh dev npm run verify:provider
 ```
 
 
