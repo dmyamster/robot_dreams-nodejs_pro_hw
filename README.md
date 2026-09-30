@@ -145,6 +145,83 @@ npm run start:prod
 
 ---
 
+---
+
+## Configuration
+
+У проєкті реалізовано централізоване керування конфігурацією з принципом **Fail-Fast** та динамічним оновленням секретів без рестарту застосунку:
+- **process.env → Zod-схема (fail-fast) → ConfigService<Env, true> → код**
+- **secrets/db_password → password: () => readFile() → pg.Pool → БД**
+
+### Список змінних оточення
+
+Усі змінні суворо описані у схемі `src/config/env.schema.ts`:
+
+| Змінна | Тип | Обовʼязкова / Дефолт | Опис |
+| --- | --- | --- | --- |
+| `NODE_ENV` | `enum('development', 'production', 'test')` | Дефолт: `development` | Режим оточення застосунку |
+| `PORT` | `number` (z.coerce) | Дефолт: `3000` | TCP-порт HTTP-сервера |
+| `DB_URL` | `string` | **Обовʼязкова** | URL підключення до PostgreSQL (без секретів) |
+| `DB_PASSWORD_PATH` | `string` | Дефолт: `./secrets/db_password` | Шлях до файлу із паролем до БД |
+
+> **Секрети поза Git та Docker-образом**: Файл `.env` та каталог `secrets/` знаходяться у `.gitignore` та `.dockerignore`. У Git комітиться виключно файл-контракт `.env.example`.
+
+### Контракт змінних (.env.example)
+
+Файл `.env.example` виступає суворим контрактом. Будь-які зміни в `src/config/env.schema.ts` вимагають відповідного оновлення `.env.example`. Звірка здійснюється скриптом:
+```bash
+npm run check:env
+```
+Якщо будь-яка змінна відсутня у `.env.example`, команда завершується з кодом 1 і списком розбіжностей.
+
+### Команди запуску
+
+```bash
+# 1. Підготовка локального середовища
+cp .env.example .env
+mkdir -p secrets && echo -n "super_secret_db_pass_123" > secrets/db_password
+
+# 2. Перевірка синхронності контракту конфігурації
+npm run check:env
+
+# 3. Запуск локального PostgreSQL у Docker Compose
+docker compose up -d
+
+# 4. Збірка та запуск додатку
+npm run start
+# або для режиму розробки:
+npm run start:dev
+```
+
+### Покрокова інструкція з ротації DB-пароля без рестарту
+
+Пароль бази даних читається динамічно з файлу `secrets/db_password` на кожне нове підключення в `pg.Pool`. Ротація виконується без жодного простою чи перезапуску Node.js процесу:
+
+1. **Перевірка доступності та фіксація uptime**:
+   ```bash
+   curl -i http://localhost:3000/health
+   ```
+   У відповіді буде повернено статус 200, стан бази `database: "connected"` та поточний час роботи процесу `uptime` (наприклад, `15.42`).
+
+2. **Виконання скрипту ротації**:
+   ```bash
+   bash rotate.sh [новий_пароль_опціонально]
+   ```
+   Скрипт послідовно виконує 3 атомарні дії:
+   - Змінює пароль користувача в PostgreSQL через `ALTER ROLE postgres WITH PASSWORD '...'`
+   - Оновлює файл секрету `secrets/db_password`
+   - Примусово закриває старі зʼєднання через `pg_terminate_backend` (пул перехоплює подію `error` без аварійного падіння процесу)
+
+3. **Перевірка успішності ротації**:
+   ```bash
+   curl -i http://localhost:3000/health
+   ```
+   Наступний запит створює нове зʼєднання до БД, використовуючи щойно оновлений файл `secrets/db_password`. Запит повертає `200 OK`, `database: "connected"`, а значення `uptime` збільшилося відносно кроку 1, підтверджуючи, що процес не перезапускався.
+
+> **Примітка**: Якщо виконати `docker compose down -v`, Postgres буде скинуто до початкового стану. У такому разі поверніть початковий пароль у файл: `echo -n "super_secret_db_pass_123" > secrets/db_password`.
+
+---
+
 ## Журнал рішень
 
 Рішення змінилось — **не переписуй розділи вище**. Додай запис сюди.
@@ -153,5 +230,6 @@ npm run start:prod
 
 - **2026-09-16 (ДЗ #0)**: Обрано домен **Paper Trading Broker API** з 5 сутностями (`User`, `Account`, `StockInstrument`, `Order`, `Position`). Зафіксовано архітектурні рішення (NestJS, PostgreSQL, RabbitMQ, Redis, K8s).
 - **2026-09-16 (ДЗ #9)**: Спроєктовано контракт `openapi/openapi.yaml` (OpenAPI 3.0.3) для ресурсів `/instruments` та `/orders`. Обрано **Варіант Б** контрактної верифікації, реалізований на **NestJS + TypeScript** з використанням `express-openapi-validator` (`validateRequests: true`, `validateResponses: true`) та `ProblemExceptionFilter` (RFC 7807 `application/problem+json`). Реалізовано повну семантику `Idempotency-Key` із заголовком `Idempotency-Replay: true`.
+- **2026-09-28 (ДЗ #11 / ДЗ #2 курсового проєкту)**: Наведено лад у конфігурації. Реалізовано єдину Zod-схему env (`src/config/env.schema.ts`) із fail-fast валідацією при старті через `ConfigModule.forRoot`, прямі звернення до `process.env` замінено на типізований `ConfigService<Env, true>`. Додано контракт `.env.example` та валідатор `scripts/check-env-example.mjs` (`npm run check:env`). Секрети винесено з Git (`.gitignore`) та шарів Docker-образу (`.dockerignore`, `Dockerfile`). Реалізовано ротацію пароля PostgreSQL без рестарту сервісу через `password: () => readFile()` у `pg.Pool`, обробку помилок завершення з'єднань пулу, скрипт `rotate.sh` та перевірочний ендпоінт `/health`.
 
 

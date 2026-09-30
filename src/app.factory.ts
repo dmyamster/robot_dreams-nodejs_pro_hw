@@ -7,9 +7,14 @@ import * as express from 'express';
 import * as path from 'node:path';
 
 export async function createNestApp() {
-  const app = await NestFactory.create(AppModule, { logger: false });
+  const app = await NestFactory.create(AppModule, {
+    abortOnError: false,
+    logger: ['error', 'warn'],
+  });
 
-  app.setGlobalPrefix('api/v1');
+  app.setGlobalPrefix('api/v1', {
+    exclude: ['health', 'api/v1/health'],
+  });
 
   app.use(express.json());
 
@@ -19,6 +24,7 @@ export async function createNestApp() {
       apiSpec: apiSpecPath,
       validateRequests: true,
       validateResponses: true,
+      ignorePaths: (reqPath: string) => reqPath.includes('health'),
     }),
   );
 
