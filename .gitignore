@@ -6,3 +6,4 @@ npm-debug.log*
 .env
 secrets/*
 !secrets/*.example
+.secrets/
