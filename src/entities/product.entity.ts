@@ -33,6 +33,9 @@ export class Product {
   @Column({ name: 'trading_status', type: 'varchar', length: 16, default: 'ACTIVE' })
   tradingStatus!: string;
 
+  @Column({ type: 'integer', default: 0 })
+  stock!: number;
+
   @Column({ name: 'logo_url', type: 'text', nullable: true })
   logoUrl!: string | null;
 

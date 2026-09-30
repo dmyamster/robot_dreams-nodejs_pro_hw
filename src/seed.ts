@@ -55,6 +55,7 @@ export async function runSeed(): Promise<void> {
       description: 'Consumer Electronics and Software Services',
       sector: 'Technology',
       currentPrice: '18500', // $185.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/aapl.png',
     },
@@ -64,6 +65,7 @@ export async function runSeed(): Promise<void> {
       description: 'Semiconductor and AI Hardware',
       sector: 'Technology',
       currentPrice: '12500', // $125.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/nvda.png',
     },
@@ -73,6 +75,7 @@ export async function runSeed(): Promise<void> {
       description: 'Cloud Computing and Enterprise Software',
       sector: 'Technology',
       currentPrice: '42000', // $420.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/msft.png',
     },
@@ -82,6 +85,7 @@ export async function runSeed(): Promise<void> {
       description: 'Investment Banking and Financial Services',
       sector: 'Financial',
       currentPrice: '19800', // $198.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/jpm.png',
     },
@@ -91,6 +95,7 @@ export async function runSeed(): Promise<void> {
       description: 'Global Payments Technology',
       sector: 'Financial',
       currentPrice: '27500', // $275.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/v.png',
     },
@@ -100,6 +105,7 @@ export async function runSeed(): Promise<void> {
       description: 'Energy and Petrochemicals',
       sector: 'Energy',
       currentPrice: '11500', // $115.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/xom.png',
     },
@@ -109,6 +115,7 @@ export async function runSeed(): Promise<void> {
       description: 'Integrated Energy Operations',
       sector: 'Energy',
       currentPrice: '15500', // $155.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/cvx.png',
     },
@@ -118,6 +125,7 @@ export async function runSeed(): Promise<void> {
       description: 'Pharmaceuticals and Medical Technologies',
       sector: 'Healthcare',
       currentPrice: '16000', // $160.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/jnj.png',
     },
@@ -127,6 +135,7 @@ export async function runSeed(): Promise<void> {
       description: 'E-commerce and Cloud Infrastructure',
       sector: 'Consumer',
       currentPrice: '18000', // $180.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/amzn.png',
     },
@@ -136,6 +145,7 @@ export async function runSeed(): Promise<void> {
       description: 'Electric Vehicles and Clean Energy',
       sector: 'Consumer',
       currentPrice: '25000', // $250.00
+      stock: 100,
       tradingStatus: 'ACTIVE',
       logoUrl: 'https://cdn.example.com/tsla.png',
     },
