@@ -10,7 +10,7 @@ const AppDataSource = new DataSource({
     ? { url: dbUrl }
     : {
         host: process.env.DB_HOST || '127.0.0.1',
-        port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 5432,
+        port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 6432,
         username: process.env.DB_USER || process.env.DB_USERNAME || 'postgres',
         password: process.env.DB_PASSWORD || 'super_secret_db_pass_123',
         database: process.env.DB_NAME || process.env.DB_DATABASE || 'broker_db',

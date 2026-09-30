@@ -410,13 +410,55 @@ RETURNING "id", "stock", "current_price", "trading_status"
 
 ---
 
+## ДЗ #15: Data layer ops (PgBouncer, Backup Script, Restore Drill)
+
+### Data layer ops
+
+#### 1. Архітектура та запуск
+Перед PostgreSQL розгорнуто пулер з'єднань **PgBouncer** (`edoburu/pgbouncer`), сконфігурований у режимі `pool_mode = transaction`. Додаток підключається до бази через порт PgBouncer (`6432`), а не напряму.
+- **Підняття стека:**
+  ```bash
+  docker compose up -d --wait
+  ```
+- **Перевірка роботи PgBouncer та статусу пулів:**
+  ```bash
+  psql -h 127.0.0.1 -p 6432 -U postgres -d broker_db -c "SELECT 1"
+  psql -p 6432 -U postgres -d pgbouncer -c "SHOW POOLS"
+  ```
+
+#### 2. Резервне копіювання (Backup)
+Резервна копія створюється у форматі PostgreSQL Custom (`pg_dump -Fc`) зі штампом дати в імені файлу. Скрипт виконується через обгортку `scripts/with-secrets.sh`:
+```bash
+export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:6432/broker_db
+export SKIP_VAULT=1
+bash scripts/with-secrets.sh dev bash scripts/backup.sh
+```
+Розклад щонічного запуску зафіксовано у файлі [backup.cron](file:///Users/dmitro/Documents/Projects/courses/robot_dreams-nodejs_pro_hw/backup.cron) (`0 2 * * *`, щоночі о 02:00 UTC).
+
+#### 3. Аварійне відновлення (Restore Drill)
+Процедура перевірки відновлення автоматизована в `scripts/restore-drill.sh`: скрипт піднімає чистий ізольований Docker-контейнер із порожнім volume, відновлює останній створений дамп (`pg_restore --no-owner`), порівнює контрольні суми ключових таблиць (`count(*)` + агрегат `sum(current_price)`) до і після відновлення, друкує `MATCH` та повністю видаляє тимчасовий контейнер і volume.
+```bash
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
+```
+Детальний протокол випробування зафіксовано у [RESTORE-DRILL.md](file:///Users/dmitro/Documents/Projects/courses/robot_dreams-nodejs_pro_hw/RESTORE-DRILL.md).
+
+#### 4. Чому `pool_mode = transaction` і що він ламає
+У режимі `transaction` PgBouncer утримує фізичне серверне з'єднання до PostgreSQL виключно на час виконання активної транзакції (між `BEGIN` та `COMMIT`/`ROLLBACK`). Як тільки транзакція завершується, з'єднання негайно повертається в пул і може обслуговувати іншого клієнта, що дозволяє підтримувати сотні й тисячі конкурентних клієнтських підключень без роздування пам'яті та процесорних витрат PostgreSQL на підтримку окремих процесів під кожне з'єднання. Проте transaction pooling ламає такі сесійні механізми:
+1. **Named Prepared Statements (іменовані підготовлені вирази):** Оскільки наступна транзакція того ж клієнта може виконуватися на іншому серверному процесі PostgreSQL, іменовані вирази, створені на рівні попереднього підключення, стають недоступними (`prepared statement does not exist`), якщо не налаштовано підтримку `max_prepared_statements` (у PgBouncer ≥ 1.21) або анонімні вирази в ORM.
+2. **Сесійні параметри та стан (`SET`, `LISTEN`/`NOTIFY`, `TEMP TABLE`):** Будь-які модифікації параметрів через `SET timezone` або `SET search_path`, тимчасові таблиці (`CREATE TEMP TABLE`) та підписки pub/sub (`LISTEN / NOTIFY`) прив'язані до конкретного серверного бекенду: у transaction mode вони або губляться між транзакціями, або небезпечно «забруднюють» сесії інших клієнтів.
+3. **Session-level блокування та курсори (`pg_advisory_lock`, `WITH HOLD` cursors):** Консультативні блокування сесійного рівня (`pg_advisory_lock`) і курсори, оголошені з параметром `WITH HOLD` (для збереження після коміту), знищуються або стають некерованими при поверненні з'єднання в пул після `COMMIT`.
+
+---
+
 ## Grading
 
 ```bash
 docker compose up -d --wait
-export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:5432/broker_db # або DB_*
-export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_PASSWORD=super_secret_db_pass_123 DB_NAME=broker_db
+export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:6432/broker_db
+export DB_HOST=127.0.0.1 DB_PORT=6432 DB_USER=postgres DB_PASSWORD=super_secret_db_pass_123 DB_NAME=broker_db
 export SKIP_VAULT=1    # у грейдера немає доступу до сховища
+bash scripts/with-secrets.sh dev bash scripts/backup.sh
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
 ```
 
 ```bash

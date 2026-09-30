@@ -1,0 +1,2 @@
+# Daily database backup at 02:00 AM UTC
+0 2 * * * cd /workspace && bash scripts/with-secrets.sh prod bash scripts/backup.sh >> /var/log/backup.log 2>&1
