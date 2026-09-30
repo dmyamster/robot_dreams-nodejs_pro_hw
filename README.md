@@ -310,6 +310,7 @@ docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT count
 - **2026-09-28 (ДЗ #11 / ДЗ #2 курсового проєкту)**: Наведено лад у конфігурації. Реалізовано єдину Zod-схему env (`src/config/env.schema.ts`) із fail-fast валідацією при старті через `ConfigModule.forRoot`, прямі звернення до `process.env` замінено на типізований `ConfigService<Env, true>`. Додано контракт `.env.example` та валідатор `scripts/check-env-example.mjs` (`npm run check:env`). Секрети винесено з Git (`.gitignore`) та шарів Docker-образу (`.dockerignore`, `Dockerfile`). Реалізовано ротацію пароля PostgreSQL без рестарту сервісу через `password: () => readFile()` у `pg.Pool`, обробку помилок завершення з'єднань пулу, скрипт `rotate.sh` та перевірочний ендпоінт `/health`.
 - **2026-09-29 (ДЗ #12 / ДЗ #3 курсового проєкту)**: Спроєктовано та реалізовано дата-шар PostgreSQL для Paper Trading Broker API. Розроблено схему (`db/schema.sql` на 5 сутностей: `users`, `accounts`, `products`/`instruments`, `orders`, `positions` із 5 зовнішніми ключами, фінансовими типами `NUMERIC(18, 4)` та збереженою генерованою колонкою `search_vector tsvector STORED`). Написано seed-скрипт (`db/seed.sql`) з наповненням 150,000 ордерів та 120,000 фінансових інструментів українською мовою з реалістичними перекошеними розподілами та фінішним `VACUUM (ANALYZE);`. Підготовлено 4 повільні запити (`db/queries/q1..q4.sql`) та оптимізуючий набір індексів (`db/indexes.sql`: композитний B-Tree `(account_id, created_at DESC)`, partial index `WHERE status = 'PENDING'`, expression index `(lower(symbol))` та FTS GIN індекс на `search_vector`). Складено детальний звіт `db/OPTIMIZATIONS.md` з вимірами `EXPLAIN (ANALYZE, BUFFERS)` до та після (десятки й сотні разів прискорення, повне виключення Seq Scan, відсутність мертвих індексів) і дослідженням специфіки морфології української мови у PostgreSQL.
 - **2026-09-29 (ДЗ #13 / ДЗ #4 курсового проєкту)**: Перенесення дата-шару в TypeORM. Реалізовано 5 сутностей (`User`, `Account`, `Product`, `Order`, `Position`), гроші переведено в цілі числа у мінорних одиницях (центи, `bigint`), налаштовано суворі `onDelete` стратегії (`CASCADE` для володіння даними користувача, `RESTRICT` для захисту фінансового аудиту активів). `synchronize: false` з початковою згенерованою міграцією (`src/migrations/1790687949981-InitialSchema.ts`). Створено ідемпотентний seed (`src/seed.ts`), демонстрацію лікування N+1 проблеми (`src/demo-nplus1.ts`), звіт ринкової аналітики через QueryBuilder (`src/report.ts`), інтеграцію зі сховищем секретів через `scripts/with-secrets.sh` із аварійним байпасом `SKIP_VAULT=1`.
+- **2026-09-30 (ДЗ #14 / ДЗ #5 курсового проєкту)**: Реалізовано транзакційний checkout із захистом від oversell та overdraft, чергу фонових задач із паралельним розбором через воркер-пул на базі `FOR UPDATE SKIP LOCKED`, та retry-патерн для обробки транзакційних конфліктів серіалізації (SQLSTATE `40001` / `40P01`) з експоненційним backoff.
 
 ---
 
@@ -357,10 +358,63 @@ docker compose exec -T postgres psql -U postgres -d broker_db -Atc "SELECT count
 
 ---
 
+---
+
+## ДЗ #14: Конкурентність і транзакції
+
+У цьому завданні реалізовано повноцінний конкурентний data-layer, здатний витримувати паралельні шквали запитів без втрачених оновлень (lost updates), овербукінгу (oversell) чи відʼємних балансів (overdraft), побудовано чергу фонових задач на `FOR UPDATE SKIP LOCKED`, а також реалізовано retry-обгортку для транзакційних serialization failures.
+
+### Конкурентність
+
+#### 1. Числа зі своїх запусків
+- **Конкурентний checkout (`npm run demo:race`)**:
+  - Кількість паралельних спроб: **50**
+  - Кількість успішних: **10** (рівно відповідає початковому `stock = 10` при `quantity = 1`)
+  - Кількість відхилених запитів: **40** (через вичерпання залишку товару)
+  - Фінальний stock: **0**
+  - Кількість рядків із відʼємним stock: **0**
+  - Час виконання конкурентного шквалу: **~72 мс**
+- **Воркер-пул задач (`npm run demo:workers`)**:
+  - Загальна кількість задач у черзі: **20**
+  - Кількість активних воркерів: **4**
+  - Задач оброблено двічі: **0** (`оброблено двічі: 0`)
+  - Розподіл задач по воркерах: **worker-1: 5**, **worker-2: 5**, **worker-3: 5**, **worker-4: 5**
+  - Загальний час паралельної обробки: **284 мс** проти розрахункового послідовного часу **1000 мс** (прискорення у 3.5 рази)
+- **Retry-патерн при serialization failure (`npm run demo:retry`)**:
+  - Початковий баланс: **1 000 000 центів** ($10,000.00)
+  - Депозит транзакції Tx1: **+5 000 центів**
+  - Депозит транзакції Tx2: **+7 000 центів**
+  - Піймано конфліктів серіалізації (`40001`): **1**
+  - Кількість повторів транзакції (retries): **1**
+  - Фінальний баланс: **1 012 000 центів** (арифметично коректний, повний збіг)
+
+#### 2. Вибір: Atomic UPDATE vs Pessimistic Lock (`SELECT ... FOR UPDATE`)
+Для операції checkout обрано **атомарний UPDATE із предикатом та поверненням значень**:
+```sql
+UPDATE "products" 
+SET "stock" = "stock" - $1, "updated_at" = NOW() 
+WHERE "id" = $2 AND "stock" >= $1 
+RETURNING "id", "stock", "current_price", "trading_status"
+```
+
+**Обґрунтування вибору:**
+1. **Мінімізація часу утримання блокування (Lock Contention Window):** `SELECT ... FOR UPDATE` захоплює row-level exclusive lock на самому початку транзакції та утримує його протягом усього життєвого циклу — включно з мережевими затримками між Node.js і PostgreSQL, формуванням об'єктів у JS та наступними INSERT-запитами. Атомарний `UPDATE` блокує рядок виключно на мікросекунди виконання самої інструкції в рушії PostgreSQL, що мінімізує очікування інших паралельних запитів.
+2. **Відсутність вікна для race condition (Zero-Race Window):** Предикат `WHERE stock >= $n` оцінюється атомарно рушієм PostgreSQL в момент захоплення рядкового локу. Якщо залишок менший за запитаний, операція повертає 0 рядків, що одразу сигналізує додатку про брак товару без необхідності проміжних читань у пам'ять Node.js.
+3. **Економія мережевих round-trips:** Об'єднання перевірки та декременту в одну команду заощаджує цілий round-trip до бази даних на кожну транзакцію.
+
+*(У коді `src/checkout.ts` також реалізовано підтримку прапорця `usePessimisticLock: true` через `QueryBuilder.setLock('pessimistic_write')` для можливості прямого порівняння обох підходів).*
+
+#### 3. Чому retry-обгортка ловить виключно коди `40001` та `40P01`
+- **`40001` (`serialization_failure`)** та **`40P01` (`deadlock_detected`)** — це специфічні транзитивні (transient) інфраструктурні помилки PostgreSQL, що виникають через часові перетини конкурентних транзакцій за умов рівнів ізоляції `REPEATABLE READ` / `SERIALIZABLE` або перехресного блокування ресурсів. Запит і бізнес-дані є абсолютно валідними, а невдача зумовлена виключно діями паралельного процесу. Перезапуск транзакції цілком з самого початку (з новим снапшотом) після короткого backoff гарантовано має найвищий шанс на успішний коміт.
+- **Усі інші помилки** (наприклад, `23505` — порушення унікальності, `23503` — порушення foreign key, `22003` — переповнення діапазону чисел, помилки валідації схеми або бізнес-правил на кшталт браку коштів/товару) є **детермінованими**. Повторення транзакції з тими самими вхідними даними неминуче завершиться тією ж самою помилкою. Їх перехоплення призвело б до нескінченних retry-циклів, маскування реальних дефектів у коді або виснаження пулу з'єднань.
+
+---
+
 ## Grading
 
 ```bash
 docker compose up -d --wait
+export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:5432/broker_db # або DB_*
 export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_PASSWORD=super_secret_db_pass_123 DB_NAME=broker_db
 export SKIP_VAULT=1    # у грейдера немає доступу до сховища
 ```
@@ -372,38 +426,37 @@ npm ci && npx tsc --noEmit
 # 2. Збірка
 npm run build
 
-# 3. Створення схеми міграцією з нуля
+# 3. Застосування міграцій схеми з нуля
 npm run migrate
 
-# 4. Перевірка статусу міграцій (показує [X])
+# 4. Перевірка статусу міграцій (показує [X] для InitialSchema та AddStockAndTaskQueue)
 npm run migrate:show
 
-# 5. Перевірка відкату схеми
-npm run migrate:revert
-
-# 6. Повторне застосування міграції
-npm run migrate
-
-# 7. Ідемпотентний seed (два запуски поспіль)
+# 5. Ідемпотентний seed (два запуски поспіль без помилок)
 npm run seed && npm run seed
 
-# 8. Демонстрація N+1 до та після
+# 6. Конкурентне навантаження без oversell (50 запитів, stock=10 -> рівно 10 успішних, stock=0, 0 негативних)
+npm run demo:race
+
+# 7. Чесний воркер-пул через SKIP LOCKED (≥2 воркери, 0 оброблено двічі, час < послідовного)
+npm run demo:workers
+
+# 8. Retry-патерн при serialization failure (піймано 40001, повтор із backoff, баланс збігається)
+npm run demo:retry
+
+# 9. Перевірка N+1 з ДЗ #13
 npm run demo:nplus1
 
-# 9. Агрегований звіт через QueryBuilder
+# 10. Агрегований звіт через QueryBuilder з ДЗ #13
 npm run report
 
-# 10. Статична перевірка обгортки зі сховищем
-node -e "const s=require('./package.json').scripts;const bad=['migrate','seed']
-  .filter(k=>/with-secrets\.sh/.test(s[k]||'')===false);
-  console.log(bad.length===0?'OK':'без обгортки: '+bad.join(', '));
-  process.exit(bad.length===0?0:1)"
-```
+# 11. Статична перевірка обгортки зі сховищем для нових демо
+node -e "const s=require('./package.json').scripts;const bad=['demo:race','demo:workers','demo:retry'].filter(k=>/with-secrets\.sh/.test(s[k]||'')===false);console.log(bad.length===0?'OK':'без обгортки: '+bad.join(', '));process.exit(bad.length===0?0:1)"
 
-### Команда перевірки кількості рядків після повторного seed
-```bash
-docker compose exec -T postgres psql -U postgres -d broker_db -c "SELECT count(*) AS users_count FROM users;" -c "SELECT count(*) AS accounts_count FROM accounts;" -c "SELECT count(*) AS products_count FROM products;" -c "SELECT count(*) AS orders_count FROM orders;" -c "SELECT count(*) AS positions_count FROM positions;"
+# 12. Пошукові критерії атомарності, skip locked та кодів помилок
+grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist "for update|returning|pessimistic_write" .
+grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist "skip[ _]locked" .
+grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist "40001|40P01" .
 ```
-*(Очікуваний результат: Users: 10, Accounts: 10, Products: 10, Orders: 20, Positions: 10).*
 
 
