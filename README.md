@@ -628,4 +628,79 @@ grep -rnE "PACT_BROKER_TOKEN[[:space:]]*[:=][[:space:]]*['\"][^'\"$]" --include=
 SKIP_VAULT=1 bash scripts/with-secrets.sh dev npm run verify:provider
 ```
 
+---
+
+## Trade-offs: WebSocket vs SSE
+
+Для продакшн-нотифікацій про зміну статусу замовлення я б обрав **Server-Sent Events (SSE)**. Оскільки цей потік за своєю природою є виключно однонаправленим (сервер інформує клієнта), SSE ідеально лягає на стандартний HTTP/2 стек, не потребує кастомного рукостискання чи збереження бідирекційного стану з'єднання, та з коробки підтримує автоматичний реконект браузера з заголовком `Last-Event-ID` для відновлення втрачених подій без сторонніх бібліотек. WebSocket доцільно використовувати лише там, де потрібен повнодуплексний двосторонній обмін з високою частотою (наприклад, чати, колаб-редактори чи біржові торгові термінали з частими клієнтськими діями).
+
+При горизонтальному масштабуванні застосунку до двох і більше інстансів локальна пам'ять та вбудовані кімнати Socket.io перестають працювати між інстансами: клієнт, підключений до інстансу №1, не отримає подію, якщо зміна статусу була оброблена інстансом №2; це вирішується підключенням спільних черг або брокера повідомлень із Redis Pub/Sub адаптером (`@socket.io/redis-adapter` або RabbitMQ), який транслює події між усіма нодами кластера.
+
+| Критерій | WebSocket | Server-Sent Events (SSE) |
+| :--- | :--- | :--- |
+| **Напрям каналу** | Повнодуплексний (двосторонній бідирекційний канал клієнт ↔ сервер) | Однонаправлений (сервер → клієнт) поверх стандартного HTTP потоку |
+| **Реконект та відновлення** | Ручний менеджмент на рівні протоколу/бібліотеки (потребує власної логіки backlog buffer) | Нативний механізм у стандарті браузера (`EventSource`), авто-повтор та заголовок `Last-Event-ID` |
+| **Вимоги до інфраструктури** | Специфічний апгрейд `101 Switching Protocols`, чутливий до проксі, фаєрволів та балансувальників | Стандартний HTTP/1.1 або HTTP/2, без проблем проходить крізь будь-які корпоративні проксі та CDN |
+| **Ціна на подію** | Мінімальний оверхед фреймінгу (2–10 байт на фрейм поверх TCP), але дорожче утримання стану з'єднань | Текстовий формат UTF-8 (`data: ...\n\n`), проте чудово стискається та мультиплексується через HTTP/2 |
+| **Обмеження підключень** | Обмежено ресурсами пам'яті/дескрипторів сервера | У HTTP/1.1 обмеження 6 з'єднань на домен у браузері; усувається переходом на HTTP/2 мультиплексування |
+
+### Інструкція запуску та перевірки (ДЗ #18)
+
+#### 1. Збірка та запуск сервера
+```bash
+# Збірка TypeScript
+npm run build
+
+# Запуск сервера
+node dist/src/main.js
+```
+
+#### 2. Перевірка SSE-заголовка
+```bash
+curl -sN --max-time 2 -D - -o /dev/null http://localhost:3000/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/events | grep -i '^content-type'
+# Очікуваний вивід:
+# Content-Type: text/event-stream
+```
+
+#### 3. Перевірка формату подій SSE
+```bash
+# В окремому терміналі запустити прослуховування:
+curl -sN --max-time 5 http://localhost:3000/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/events
+
+# В іншому терміналі змінити статус замовлення:
+curl -s -X PATCH http://localhost:3000/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/status \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"CANCELLED"}'
+```
+
+#### 4. Перевірка відновлення подій через Last-Event-ID
+```bash
+# Виконати щонайменше 4 зміни статусу (1..N, N >= 4):
+curl -s -X PATCH http://localhost:3000/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/status -H 'Content-Type: application/json' -d '{"status":"PENDING"}'
+curl -s -X PATCH http://localhost:3000/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/status -H 'Content-Type: application/json' -d '{"status":"FILLED"}'
+curl -s -X PATCH http://localhost:3000/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/status -H 'Content-Type: application/json' -d '{"status":"CANCELLED"}'
+curl -s -X PATCH http://localhost:3000/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/status -H 'Content-Type: application/json' -d '{"status":"FILLED"}'
+
+# Запит з Last-Event-ID: 3 має повернути першу пропущену подію з id > 3:
+curl -sN --max-time 2 -H 'Last-Event-ID: 3' http://localhost:3000/orders/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/events | grep '^id:' | head -1
+# Очікуваний вивід:
+# id: 4
+```
+
+#### 5. Перевірка ізоляції кімнат WebSocket (headless-демо)
+```bash
+# Основний прогін: клієнти в різних кімнатах (B не має чути подію замовлення A)
+node scripts/realtime-demo.mjs; echo "exit=$?"
+# A_RECEIVED=1
+# B_RECEIVED=0
+# exit=0
+
+# Контрольний прогін: обидва клієнти в кімнаті замовлення A (B мусить почути)
+node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
+# A_RECEIVED=1
+# B_RECEIVED=1
+# exit=0
+```
+
+
 
