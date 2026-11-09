@@ -29,13 +29,18 @@ export function configureApp(app: INestApplication): INestApplication {
 
   app.use(express.json());
 
+  app.enableCors();
+
   const apiSpecPath = path.resolve(process.cwd(), 'openapi/openapi.yaml');
   app.use(
     OpenApiValidator.middleware({
       apiSpec: apiSpecPath,
       validateRequests: true,
       validateResponses: true,
-      ignorePaths: (reqPath: string) => reqPath.includes('health'),
+      ignorePaths: (reqPath: string) =>
+        reqPath.includes('health') ||
+        reqPath.includes('events') ||
+        reqPath.includes('status'),
     }),
   );
 

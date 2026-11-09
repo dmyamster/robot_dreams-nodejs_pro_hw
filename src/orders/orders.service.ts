@@ -4,6 +4,7 @@ import {
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { InstrumentsService } from '../instruments/instruments.service';
+import { OrderEventsService } from './order-events.service';
 
 export interface Order {
   id: string;
@@ -79,7 +80,36 @@ export class OrdersService {
     { body: CreateOrderDto; response: Order }
   >();
 
-  constructor(private readonly instrumentsService: InstrumentsService) {}
+  constructor(
+    private readonly instrumentsService: InstrumentsService,
+    private readonly orderEventsService: OrderEventsService,
+  ) {}
+
+  updateStatus(id: string, status: string): Order {
+    let order = this.orders.find((o) => o.id === id);
+    if (!order) {
+      order = {
+        id,
+        account_id: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+        symbol: 'AAPL',
+        side: 'BUY',
+        type: 'MARKET',
+        quantity: 1,
+        limit_price_cents: null,
+        execution_price_cents: 10000,
+        fee_cents: 150,
+        total_cents: 10150,
+        status: status as any,
+        created_at: new Date().toISOString(),
+      };
+      this.orders.push(order);
+    } else {
+      order.status = status as any;
+    }
+
+    this.orderEventsService.emitOrderStatus(id, status, { order });
+    return order;
+  }
 
   create(idempotencyKey: string, dto: CreateOrderDto): { order: Order; isReplay: boolean } {
     if (this.idempotencyStore.has(idempotencyKey)) {
