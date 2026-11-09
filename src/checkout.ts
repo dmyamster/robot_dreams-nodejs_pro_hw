@@ -1,5 +1,8 @@
 import { DataSource } from 'typeorm';
+import * as crypto from 'crypto';
+import * as amqp from 'amqplib';
 import { Product, Order, OrderTask } from './entities';
+import { OrderPlacedEvent, OrderEventPublisher, createConnection } from './rabbitmq';
 
 export interface CheckoutInput {
   accountId: string;
@@ -7,6 +10,8 @@ export interface CheckoutInput {
   quantity: number;
   idempotencyKey?: string;
   usePessimisticLock?: boolean;
+  publishEvent?: boolean;
+  amqpConnection?: amqp.ChannelModel;
 }
 
 export interface CheckoutResult {
@@ -14,6 +19,7 @@ export interface CheckoutResult {
   task: OrderTask;
   remainingStock: number;
   remainingBalance: string;
+  event?: OrderPlacedEvent;
 }
 
 /**
@@ -36,7 +42,7 @@ export async function checkout(
     throw new Error(`Invalid checkout quantity: ${quantity}. Must be greater than 0.`);
   }
 
-  return await dataSource.transaction(async (manager) => {
+  const result = await dataSource.transaction(async (manager) => {
     let remainingStock: number;
 
     if (usePessimisticLock) {
@@ -155,11 +161,46 @@ export async function checkout(
     });
     const savedTask = await taskRepo.save(task);
 
+    // Build explicitly designed event contract (not ORM entity spread)
+    const event: OrderPlacedEvent = {
+      eventId: crypto.randomUUID(),
+      type: 'order.placed',
+      occurredAt: new Date().toISOString(),
+      data: {
+        orderId: savedOrder.id,
+        accountId: savedOrder.accountId,
+        productId: savedOrder.productId,
+        symbol: product.symbol,
+        quantity: savedOrder.quantity,
+        price: product.currentPrice,
+        totalAmount: totalAmount.toString(),
+      },
+    };
+
     return {
       order: savedOrder,
       task: savedTask,
       remainingStock,
       remainingBalance,
+      event,
     };
   });
+
+  // If async publishing requested: publish over RabbitMQ confirm channel
+  if (input.publishEvent && result.event) {
+    let localConn: amqp.ChannelModel | null = null;
+    try {
+      const conn = input.amqpConnection || (localConn = await createConnection());
+      const publisher = new OrderEventPublisher(conn);
+      await publisher.publishOrderPlaced(result.event);
+      await publisher.close();
+    } finally {
+      if (localConn) {
+        const c: amqp.ChannelModel = localConn;
+        await c.close();
+      }
+    }
+  }
+
+  return result;
 }
