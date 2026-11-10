@@ -10,6 +10,8 @@ import { OrderPlacedEvent } from "./contracts";
 export interface ConsumerStats {
   delivered: number;
   effect: number;
+  applied: number;
+  processed: number;
   acked: number;
   rejected: number;
   skipped: number;
@@ -17,6 +19,7 @@ export interface ConsumerStats {
 
 export interface ConsumerOptions {
   prefetch?: number;
+  consumerName?: string;
   beforeAck?: (
     msg: amqp.ConsumeMessage,
     event: OrderPlacedEvent,
@@ -27,9 +30,12 @@ export interface ConsumerOptions {
 export class OrderPlacedConsumer {
   private channel: amqp.Channel | null = null;
   private consumerTag: string | null = null;
+  public readonly consumerName: string;
   public stats: ConsumerStats = {
     delivered: 0,
     effect: 0,
+    applied: 0,
+    processed: 0,
     acked: 0,
     rejected: 0,
     skipped: 0,
@@ -39,7 +45,10 @@ export class OrderPlacedConsumer {
     private readonly connection: amqp.ChannelModel,
     private readonly dataSource: DataSource,
     private readonly prefetchCount: number = DEFAULT_PREFETCH,
-  ) {}
+    consumerName: string = "order-notification-consumer",
+  ) {
+    this.consumerName = consumerName;
+  }
 
   async start(options?: ConsumerOptions): Promise<void> {
     this.channel = await this.connection.createChannel();
@@ -50,6 +59,8 @@ export class OrderPlacedConsumer {
     const prefetch = options?.prefetch ?? this.prefetchCount;
     // Set explicit prefetch to prevent buffer overrun and starvation
     await this.channel.prefetch(prefetch);
+
+    const activeConsumerName = options?.consumerName ?? this.consumerName;
 
     const { consumerTag } = await this.channel.consume(
       RABBITMQ_QUEUE_ORDER_PLACED,
@@ -80,14 +91,31 @@ export class OrderPlacedConsumer {
         }
 
         let isDuplicate = false;
+        const queryRunner = this.dataSource.createQueryRunner();
+        await queryRunner.connect();
+        await queryRunner.startTransaction();
+
         try {
-          // Idempotent effect via natural key constraint in durable storage:
-          // INSERT INTO processed_events ... ON CONFLICT DO NOTHING RETURNING event_id
-          const insertResult = await this.dataSource.query(
+          // Level 2 Idempotency (Inbox Pattern):
+          // Check & record (message_id, consumer) in processed_messages within the SAME transaction.
+          const inboxResult = await queryRunner.query(
+            `INSERT INTO "processed_messages" ("message_id", "consumer", "processed_at")
+             VALUES ($1, $2, NOW())
+             ON CONFLICT ("message_id", "consumer") DO NOTHING
+             RETURNING "message_id"`,
+            [event.eventId, activeConsumerName],
+          );
+
+          const inboxRows = Array.isArray(inboxResult[0])
+            ? inboxResult[0]
+            : inboxResult;
+          const isNewMessage = inboxRows && inboxRows.length > 0;
+
+          // Maintain processed_events for backwards compatibility with HW19
+          await queryRunner.query(
             `INSERT INTO "processed_events" ("event_id", "event_type", "order_id", "payload", "created_at")
              VALUES ($1, $2, $3, $4, NOW())
-             ON CONFLICT ("event_id") DO NOTHING
-             RETURNING "event_id"`,
+             ON CONFLICT ("event_id") DO NOTHING`,
             [
               event.eventId,
               event.type,
@@ -96,41 +124,56 @@ export class OrderPlacedConsumer {
             ],
           );
 
-          const insertedRows = Array.isArray(insertResult[0])
-            ? insertResult[0]
-            : insertResult;
-
-          if (insertedRows && insertedRows.length > 0) {
-            // Natural key conflict did not occur: apply business effect
-            await this.dataSource.query(
+          if (isNewMessage) {
+            // Level 1 Idempotency (Natural Key):
+            // Business effect applied with natural key constraint (event_id UNIQUE)
+            const effectResult = await queryRunner.query(
               `INSERT INTO "order_notifications" ("id", "event_id", "order_id", "message", "created_at")
                VALUES (uuid_generate_v4(), $1, $2, $3, NOW())
-               ON CONFLICT ("event_id") DO NOTHING`,
+               ON CONFLICT ("event_id") DO NOTHING
+               RETURNING "id"`,
               [
                 event.eventId,
                 event.data?.orderId || null,
                 `Order ${event.data?.orderId} for ${event.data?.quantity} shares of ${event.data?.symbol} placed successfully.`,
               ],
             );
-            this.stats.effect++;
+
+            const effectRows = Array.isArray(effectResult[0])
+              ? effectResult[0]
+              : effectResult;
+
+            if (effectRows && effectRows.length > 0) {
+              this.stats.effect++;
+              this.stats.applied++;
+            }
+            this.stats.processed++;
           } else {
-            // Already present in durable storage: duplicate detected, skip effect
+            // Message was already processed by this consumer: skip effect!
             isDuplicate = true;
             this.stats.skipped++;
           }
+
+          // Commit both inbox marking and effect in a single COMMIT
+          await queryRunner.commitTransaction();
 
           // Optional hook (e.g. for simulating process death before ack)
           if (options?.beforeAck) {
             await options.beforeAck(msg, event, isDuplicate);
           }
 
-          // Manual ACK: only after effect has been safely applied to DB
+          // Manual ACK: only after effect has been safely committed to DB
           this.channel?.ack(msg);
           this.stats.acked++;
         } catch {
+          if (queryRunner.isTransactionActive) {
+            await queryRunner.rollbackTransaction();
+          }
           // DB or unrecoverable processing error -> reject without requeue to DLX
           this.stats.rejected++;
           this.channel?.reject(msg, false);
+        } finally {
+          await queryRunner.release();
         }
       },
       { noAck: false }, // Manual acknowledgment enforced

@@ -4,3 +4,4 @@ export * from "./rabbitmq.connection";
 export * from "./topology";
 export * from "./publisher";
 export * from "./consumer";
+export * from "./outbox-relay";

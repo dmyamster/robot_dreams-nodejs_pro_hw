@@ -1,7 +1,7 @@
 import { DataSource } from 'typeorm';
 import * as crypto from 'crypto';
 import * as amqp from 'amqplib';
-import { Product, Order, OrderTask } from './entities';
+import { Product, Order, OrderTask, Outbox } from './entities';
 import { OrderPlacedEvent, OrderEventPublisher, createConnection } from './rabbitmq';
 
 export interface CheckoutInput {
@@ -12,6 +12,7 @@ export interface CheckoutInput {
   usePessimisticLock?: boolean;
   publishEvent?: boolean;
   amqpConnection?: amqp.ChannelModel;
+  simulateCrashAfterOutbox?: boolean;
 }
 
 export interface CheckoutResult {
@@ -20,17 +21,43 @@ export interface CheckoutResult {
   remainingStock: number;
   remainingBalance: string;
   event?: OrderPlacedEvent;
+  outbox?: Outbox;
+  isReplay?: boolean;
 }
 
 /**
- * Transactional checkout:
+ * Explicitly designed event contract: converts business entity into external message contract.
+ * Prevents internal DB schema leaks and decouples consumers from internal column definitions.
+ */
+export function toOrderPlacedEvent(order: Order, product: Product): OrderPlacedEvent {
+  return {
+    eventId: order.id || crypto.randomUUID(),
+    type: 'order.placed',
+    occurredAt: (order.createdAt || new Date()).toISOString(),
+    data: {
+      orderId: order.id,
+      accountId: order.accountId,
+      productId: order.productId,
+      symbol: product.symbol,
+      quantity: order.quantity,
+      price: order.executionPrice || product.currentPrice,
+      totalAmount: order.totalAmount,
+    },
+  };
+}
+
+/**
+ * Transactional checkout with Transactional Outbox:
  * - Checks & atomically decrements product stock (protecting against oversell)
  * - Checks & atomically decrements buyer account balance (protecting against overdraft)
+ * - Checks idempotency key: returns existing order on identical key, rejects mismatched payloads
  * - Inserts the filled Order record
- * - Inserts the post-processing task for async worker handling (e.g. receipt/confirmation)
+ * - Inserts the post-processing task
+ * - Inserts the Outbox record with explicit event payload
  *
- * All operations execute within a single database transaction.
- * If any check fails, the transaction is rolled back completely: no orphan orders or inconsistent stock.
+ * All operations execute within a single database transaction (single COMMIT).
+ * NO broker publish takes place inside the transaction.
+ * If any error or crash occurs, the entire state rolls back cleanly.
  */
 export async function checkout(
   dataSource: DataSource,
@@ -43,10 +70,38 @@ export async function checkout(
   }
 
   const result = await dataSource.transaction(async (manager) => {
+    // Level 3 Idempotency at API edge: check if idempotencyKey has already been used
+    if (idempotencyKey) {
+      const existingOrder = await manager.findOne(Order, {
+        where: { idempotencyKey },
+        relations: { product: true },
+      });
+
+      if (existingOrder) {
+        if (
+          existingOrder.accountId !== accountId ||
+          existingOrder.productId !== productId ||
+          existingOrder.quantity !== quantity
+        ) {
+          throw new Error(
+            'Idempotency key was already used with a different request payload',
+          );
+        }
+
+        return {
+          order: existingOrder,
+          task: null as any,
+          remainingStock: Number(existingOrder.product?.stock ?? 0),
+          remainingBalance: '0',
+          event: undefined,
+          isReplay: true,
+        };
+      }
+    }
+
     let remainingStock: number;
 
     if (usePessimisticLock) {
-      // Alternative approach: SELECT ... FOR UPDATE (pessimistic_write lock)
       const product = await manager
         .createQueryBuilder(Product, 'product')
         .setLock('pessimistic_write')
@@ -69,8 +124,6 @@ export async function checkout(
       await manager.save(product);
       remainingStock = product.stock;
     } else {
-      // Primary recommended approach: Atomic UPDATE ... WHERE stock >= $n RETURNING stock
-      // Row is locked exclusively by PostgreSQL only for the duration of the UPDATE statement.
       const updateStockResult = await manager.query(
         `UPDATE "products" 
          SET "stock" = "stock" - $1, "updated_at" = NOW() 
@@ -107,8 +160,7 @@ export async function checkout(
     const fee = 150n; // 150 cents = $1.50
     const totalAmount = price * BigInt(quantity) + fee;
 
-    // Atomic debit buyer balance with overdraft protection:
-    // UPDATE accounts SET cash_balance = cash_balance - $1 WHERE id = $2 AND cash_balance >= $1 RETURNING cash_balance
+    // Atomic debit buyer balance with overdraft protection
     const updateBalanceResult = await manager.query(
       `UPDATE "accounts" 
        SET "cash_balance" = "cash_balance" - $1, "updated_at" = NOW() 
@@ -144,7 +196,7 @@ export async function checkout(
     });
     const savedOrder = await orderRepo.save(order);
 
-    // INSERT post-processing task in the same transaction
+    // INSERT post-processing task
     const taskRepo = manager.getRepository(OrderTask);
     const task = taskRepo.create({
       orderId: savedOrder.id,
@@ -161,21 +213,24 @@ export async function checkout(
     });
     const savedTask = await taskRepo.save(task);
 
-    // Build explicitly designed event contract (not ORM entity spread)
-    const event: OrderPlacedEvent = {
-      eventId: crypto.randomUUID(),
+    // Build explicitly designed event contract
+    const event = toOrderPlacedEvent(savedOrder, product);
+
+    // INSERT row into outbox table in the SAME transaction
+    const outboxRepo = manager.getRepository(Outbox);
+    const outboxRecord = outboxRepo.create({
+      aggregateType: 'order',
+      aggregateId: savedOrder.id,
       type: 'order.placed',
-      occurredAt: new Date().toISOString(),
-      data: {
-        orderId: savedOrder.id,
-        accountId: savedOrder.accountId,
-        productId: savedOrder.productId,
-        symbol: product.symbol,
-        quantity: savedOrder.quantity,
-        price: product.currentPrice,
-        totalAmount: totalAmount.toString(),
-      },
-    };
+      payload: event,
+      attempts: 0,
+    });
+    const savedOutbox = await outboxRepo.save(outboxRecord);
+
+    // Simulated crash after outbox insert (for demo:crash-write)
+    if (input.simulateCrashAfterOutbox) {
+      throw new Error('Simulated write failure after outbox insert (demo:crash-write)');
+    }
 
     return {
       order: savedOrder,
@@ -183,10 +238,12 @@ export async function checkout(
       remainingStock,
       remainingBalance,
       event,
+      outbox: savedOutbox,
+      isReplay: false,
     };
   });
 
-  // If async publishing requested: publish over RabbitMQ confirm channel
+  // Optional async publishing fallback (if requested by older tests)
   if (input.publishEvent && result.event) {
     let localConn: amqp.ChannelModel | null = null;
     try {

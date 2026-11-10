@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { DataSource } from 'typeorm';
-import { User, Account, Product, Order, Position, OrderTask, ProcessedEvent, OrderNotification } from './entities';
+import { User, Account, Product, Order, Position, OrderTask, ProcessedEvent, OrderNotification, Outbox, ProcessedMessage } from './entities';
 
 const dbUrl = process.env.DATABASE_URL || process.env.DB_URL;
 
@@ -17,7 +17,7 @@ const AppDataSource = new DataSource({
       }),
   synchronize: false,
   logging: process.env.DB_LOGGING === 'true',
-  entities: [User, Account, Product, Order, Position, OrderTask, ProcessedEvent, OrderNotification],
+  entities: [User, Account, Product, Order, Position, OrderTask, ProcessedEvent, OrderNotification, Outbox, ProcessedMessage],
   migrations: [__dirname + '/migrations/*{.ts,.js}'],
   extra: {
     max: 60,
