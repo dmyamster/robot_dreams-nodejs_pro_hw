@@ -41,5 +41,11 @@ else
   if [ -z "${JWT_KID:-}" ]; then
     export JWT_KID="dev-1"
   fi
+  if [ -z "${STORAGE_ACCESS_KEY:-}" ] && [ -f "$ROOT/secrets/storage_access_key" ]; then
+    export STORAGE_ACCESS_KEY="$(tr -d '\r\n' < "$ROOT/secrets/storage_access_key")"
+  fi
+  if [ -z "${STORAGE_SECRET_KEY:-}" ] && [ -f "$ROOT/secrets/storage_secret_key" ]; then
+    export STORAGE_SECRET_KEY="$(tr -d '\r\n' < "$ROOT/secrets/storage_secret_key")"
+  fi
   exec "$@"
 fi
