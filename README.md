@@ -758,7 +758,146 @@ $$10 \times 0.02\text{ с} = 0.2\text{ с} \ll 1800\text{ с}$$
 
 ---
 
-## Grading (ДЗ #16 Acceptance Criteria)
+## Outbox та ідемпотентність (ДЗ #22)
+
+### 1. Результати трьох демо-прогонів
+
+#### А. Happy path та ключ ідемпотентності на API-краю (`npm run demo:outbox`)
+Два однакових запити на купівлю акцій із спільним заголовком `Idempotency-Key` надсилаються на сервер. Перший запит створює замовлення і в тій самій транзакції вставляє подію в `outbox`. Другий запит повертає збережений результат (`isReplay = true`), не створюючи повторних замовлень чи записів у чергу. Після цього relay-воркер вичитує та публікує подію в RabbitMQ, а споживач обробляє її рівно один раз:
+```
+requests=2
+orders=1
+outbox=1
+published=1
+deliveries=1
+effect=1
+processed=1
+```
+
+#### Б. Фейл бізнес-запису не випускає подію назовні (`npm run demo:crash-write`)
+Транзакція створення замовлення та вставки запису в `outbox` аварійно падає вже **після** вставки рядка в `outbox`, але **до** `COMMIT`. Обидва рядки відкочуються разом у межах єдиної транзакції PostgreSQL. Relay-воркер не знаходить жодного запису для публікації, споживач не отримує жодного повідомлення:
+```
+write-failed=1
+orders=0
+outbox=0
+published=0
+deliveries=0
+effect=0
+```
+
+#### В. Подія публікується вдруге після фейлу службового запису (`npm run demo:crash-relay`)
+Замовлення та outbox-запис успішно закомічені в базу. Relay-воркер вичитує повідомлення, успішно відправляє його в RabbitMQ, але перед оновленням `published_at` у базі даних імітується аварійне падіння процесу (ROLLBACK транзакції relay). У результаті в базі статус лишається `published_at IS NULL`. Під час другого прогону (recovery) relay повторно вичитує те саме повідомлення і публікує його вдруге. Брокер доставляє дві копії повідомлення (`deliveries=2`), проте завдяки дворівневій ідемпотентності споживача (таблиця `processed_messages` та природний ключ у `order_notifications`) ефект застосовується рівно один раз:
+```
+published=2
+deliveries=2
+applied=1
+effect=1
+processed=1
+```
+
+---
+
+### 2. Чому не можна просто поміняти місцями `publish` і `UPDATE published_at`
+
+Порядок дій у relay-воркері є фундаментальним архітектурним вибором: **спочатку `publish` у брокер, і лише після успішного підтвердження — `UPDATE outbox SET published_at = NOW()`**.
+
+Якщо спробувати поміняти цей порядок місцями — тобто спочатку зафіксувати `UPDATE published_at = NOW()` у базі даних, а вже потім викликати публікацію в брокер, — будь-яке аварійне падіння процесу, мережевий збій або перезавантаження брокера між цими двома операціями призведе до **непоправної втрати повідомлення (silent message loss)**. Оскільки запис у таблиці outbox уже помічений як опублікований (`published_at IS NOT NULL`), фоновий polling-воркер (`WHERE published_at IS NULL`) більше ніколи не прочитає його і не повторить відправку. Зовнішній світ ніколи не дізнається про факт створення замовлення, а автоматично відновити втрачену подію неможливо.
+
+Порядок `publish → UPDATE` обирає між дублем і втратою на користь дубля: якщо збій стається після публікації в чергу, але до фіксації `published_at` у базі, подія буде вичитана і надіслана повторно (**гарантія at-least-once**). Повторна доставка надійно та штатно нейтралізується дедуплікацією на ідемпотентному консюмері (рівень природного ключа та inbox `processed_messages`), тоді як втрату повідомлення компенсувати неможливо. Дубль лікується дедуплікацією, а втрата не лікується нічим.
+
+---
+
+### 3. Моделювання падіння relay у `demo:crash-relay`
+
+Для `demo:crash-relay` обрано **змодельований обрив транзакції relay** (виняток та відкат транзакції `ROLLBACK`) рівно в критичній точці: після того, як `publisher.publishOrderPlaced(event)` успішно отримав підтвердження від RabbitMQ Confirm Channel, але до виконання `UPDATE outbox SET published_at = NOW()`. 
+
+Це на 100% повторює наслідки реального аварійного крашу процесу чи обриву мережевого з'єднання з базою даних у продакшені: брокер уже прийняв повідомлення і помістив його в чергу, а транзакція в PostgreSQL скасована, тому `published_at` залишається `NULL`. Під час наступної ітерації relay-воркер вичитує той самий рядок і публікує повторну копію події.
+
+---
+
+### 4. Стратегія очищення таблиці `outbox` (Retention & Index Maintenance)
+
+Таблиця `outbox` неперервно наповнюється з кожною бізнес-операцією. Якщо її не очищати, вона розростається до мільйонів рядків, що створює значний bloat таблиці та навантажує сховище.
+
+Для вирішення цієї проблеми в проєкті реалізовано комбінований підхід:
+1. **Частковий індекс (Partial Index):** Індекс побудовано з фільтром `WHERE published_at IS NULL` (`idx_outbox_unpublished ON outbox (created_at, id) WHERE published_at IS NULL`). Розмір цього індексу пропорційний виключно поточному невинесеному беклогу подій (зазвичай десятки чи сотні рядків), тому швидкість вибірки relay-воркера не деградує з часом, навіть коли в таблиці накопичено мільйони записів.
+2. **Retention Policy (Очищення):** Для видалення вже доставлених повідомлень застосовується регламентний фоновий процес (cron job), який у години мінімального навантаження видаляє старі записи батчами (щоб уникнути довгих блокувань таблиці):
+   ```sql
+   DELETE FROM "outbox"
+   WHERE "id" IN (
+     SELECT "id" FROM "outbox"
+     WHERE "published_at" < NOW() - INTERVAL '7 days'
+     LIMIT 5000
+   );
+   ```
+3. Для високоінтенсивного продакшену рекомендується партиціонування за часом (`PARTITION BY RANGE (created_at)`) із швидким відкиданням старих секцій через `DROP TABLE outbox_y2026m09` без транзакційного навантаження на диск.
+
+---
+
+### 5. Порядок повідомлень: `ORDER BY` vs `SKIP LOCKED` та партиціонування
+
+У relay-воркері використовується запит `SELECT ... WHERE published_at IS NULL ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT N`. Сортування `ORDER BY` визначає лише черговість вибірки в межах одного потоку.
+
+При запуску декількох паралельних релей-воркерів прапорець `SKIP LOCKED` розподіляє різні незаблоковані пачки рядків між конкурентними процесами без взаємного очікування. Через різну тривалість мережевих викликів до брокера глобальний порядок публікації та доставки подій між паралельними воркерами не гарантується. Строгий FIFO-порядок можливий лише в межах **ключа партиціонування** (`aggregate_id` / routing key у RabbitMQ) шляхом маршрутизації подій одного агрегата в конкретну чергу або використання механізму `Single Active Consumer`.
+
+---
+
+## Grading (ДЗ #22 Acceptance Criteria)
+
+```bash
+docker compose up -d --wait
+
+export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:5432/broker_db
+export BROKER_URL=amqp://app:app@127.0.0.1:5672
+export SKIP_VAULT=1
+
+npm ci
+npm run migrate
+
+# 1. Чиста компіляція
+npm ci && npx tsc --noEmit
+
+# 2. Happy path + ключ ідемпотентності на API-краю: requests=2, orders=1, outbox=1, published=1, effect=1, processed=1
+npm run demo:outbox | tee /tmp/o.txt; echo "exit=${PIPESTATUS[0]}"
+for k in requests=2 orders=1 outbox=1 published=1 effect=1 processed=1; do
+  grep -qx "$k" /tmp/o.txt || echo "НЕМАЄ: $k"
+done
+
+# 3. Фейл бізнес-запису не випускає подію назовні: write-failed=1, orders=0, outbox=0, published=0, deliveries=0, effect=0
+npm run demo:crash-write | tee /tmp/cw.txt; echo "exit=${PIPESTATUS[0]}"
+for k in write-failed=1 orders=0 outbox=0 published=0 deliveries=0 effect=0; do
+  grep -qx "$k" /tmp/cw.txt || echo "НЕМАЄ: $k"
+done
+
+# 4. Подія публікується вдруге після фейлу службового запису: deliveries >= 2, applied=1, effect=1, processed=1
+npm run demo:crash-relay | tee /tmp/c.txt; echo "exit=${PIPESTATUS[0]}"
+awk -F= '/^deliveries=/{ok=($2>=2)} END{exit !ok}' /tmp/c.txt && echo "deliveries>=2 OK"
+for k in applied=1 effect=1 processed=1; do
+  grep -qx "$k" /tmp/c.txt || echo "НЕМАЄ: $k"
+done
+
+# 5. SKIP LOCKED у коді relay
+grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist "skip[ _-]*locked" .
+
+# 6. Дедуп через конфлікт (ON CONFLICT DO NOTHING)
+grep -rniE --include='*.ts' --exclude-dir=node_modules --exclude-dir=dist \
+  "on[ _]*conflict|do[ _]+nothing|or[ _]*ignore|skip[ _]*duplicates|ignore[ _]*duplicates|23505|P2002" .
+
+# 7. Демо викликаються через scripts/with-secrets.sh
+node -e "const s=require('./package.json').scripts;const bad=['demo:outbox','demo:crash-write','demo:crash-relay'].filter(k=>/with-secrets\.sh/.test(s[k]||'')===false);console.log(bad.length===0?'OK':'без обгортки: '+bad.join(', '));process.exit(bad.length===0?0:1)"
+
+# 8. Наявність розділу Grading у README
+grep -rlE '^#{1,3} +Grading' --include='README.md' --exclude-dir=node_modules . | wc -l
+
+# 9. Відсутність трекнутих env-файлів із живими кредами
+for f in $(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -vE '\.(example|sample|template|dist)$'); do
+  grep -lE '=(amqps?|postgres(ql)?|redis|https?)://[^ ]*:[^ @]+@' "$f"
+done
+```
+
+---
+
+### Архівні критерії оцінки (ДЗ #16)
 
 ```bash
 # 1. Чиста компіляція
