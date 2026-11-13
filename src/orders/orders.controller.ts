@@ -11,12 +11,15 @@ import {
   Req,
   HttpStatus,
   BadRequestException,
+  UseGuards,
 } from '@nestjs/common';
 import { Response, Request } from 'express';
 import { OrdersService, CreateOrderDto } from './orders.service';
 import { OrderEventsService, OrderStatusEvent } from './order-events.service';
+import { AuthenticatedRequest, JwtAuthGuard } from '../auth/jwt-auth.guard';
 
 @Controller('orders')
+@UseGuards(JwtAuthGuard)
 export class OrdersController {
   constructor(
     private readonly ordersService: OrdersService,
@@ -27,9 +30,14 @@ export class OrdersController {
   createOrder(
     @Headers('idempotency-key') idempotencyKey: string,
     @Body() createOrderDto: CreateOrderDto,
+    @Req() req: AuthenticatedRequest,
     @Res() res: Response,
   ) {
-    const result = this.ordersService.create(idempotencyKey, createOrderDto);
+    const result = this.ordersService.create(
+      idempotencyKey,
+      createOrderDto,
+      req.user.sub,
+    );
 
     if (result.isReplay) {
       res.setHeader('Idempotency-Replay', 'true');
@@ -40,11 +48,12 @@ export class OrdersController {
 
   @Get()
   getOrders(
+    @Req() req: AuthenticatedRequest,
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
   ) {
     const parsedLimit = limit ? parseInt(limit, 10) : 20;
-    return this.ordersService.findAll(parsedLimit, cursor);
+    return this.ordersService.findAll(parsedLimit, cursor, req.user);
   }
 
   @Get(':id/events')
@@ -93,8 +102,11 @@ export class OrdersController {
   }
 
   @Get(':id')
-  getOrderById(@Param('id') id: string) {
-    return this.ordersService.findById(id);
+  getOrderById(
+    @Param('id') id: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.ordersService.findById(id, req.user);
   }
 
   @Patch(':id/status')

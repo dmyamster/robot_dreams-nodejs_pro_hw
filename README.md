@@ -1048,6 +1048,53 @@ node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
 
 ---
 
+## Auth
+
+### 1. Змінні оточення
+
+| Змінна | Що це | Джерело | Формат |
+|---|---|---|---|
+| `JWT_PRIVATE_KEY` | Приватний ключ підпису access-токенів (ES256) | сховище (#11) | base64(PKCS8 PEM), без дефолту |
+| `JWT_PUBLIC_KEY` | Публічний ключ верифікації access-токенів (ES256) | сховище (#11) | base64(SPKI PEM), без дефолту |
+| `REFRESH_TOKEN_PEPPER` | Секретний «перець» для HMAC-SHA256 хешування refresh-токенів | сховище (#11) | рядок >= 32 байти, без дефолту |
+| `JWT_KID` | Ідентифікатор активного ключа підпису | оточення / compose | рядок (дефолт `dev-1`) |
+| `JWT_ISSUER` | Видавець токенів (`iss`) | оточення / compose | рядок |
+| `JWT_AUDIENCE` | Аудиторія токенів (`aud`) | оточення / compose | рядок |
+| `ACCESS_TOKEN_TTL_SECONDS` | Час життя access-токена в секундах | оточення / compose | ціле число (дефолт `900` = 15 хв) |
+| `REFRESH_TOKEN_TTL_SECONDS` | Час життя refresh-токена в секундах | оточення / compose | ціле число (дефолт `604800` = 7 діб) |
+| `DB_URL` | Рядок підключення до PostgreSQL | compose / оточення | URI без зашитих прод-секретів |
+| `REDIS_QUEUE_URL` | Redis (`noeviction` + AOF) для денилиста `jti` | compose / оточення | URI |
+
+### 2. Вибір алгоритму та allowlist
+
+Для підпису access-токенів обрано **ES256** (ECDSA на кривій P-256 із SHA-256). OWASP позначає RS256 як «Not recommended» і радить ES256 / PS256 / EdDSA, оскільки ES256 дає компактніші ключі й підписи за вищої криптостійкості на біт. У `JwtService.verifyAccessToken` передається явний allowlist `algorithms: ['ES256']` (вимога RFC 8725 §3.1), який відхиляє токени з `alg: none` або `HS256` ще до перевірки підпису.
+
+### 3. Overlap-ротація ключа підпису та роль `kid`
+
+Кожен виданий access-токен містить у захищеному заголовку поле `kid` (Key ID). Під час планової ротації ключа:
+1. Новий публічний ключ (`kid=prod-2`) додається до набору ключів верифікатора **поруч** зі старим (`kid=prod-1`).
+2. Сервіс перемикає підпис нових токенів на новий приватний ключ (`kid=prod-2`).
+3. Протягом `ACCESS_TOKEN_TTL_SECONDS` (15 хв) обидва ключі залишаються валідними для перевірки — клієнти не отримують 401.
+4. Після спливу TTL старий публічний ключ (`kid=prod-1`) видаляється з верифікатора.
+
+Відбитки публічних ключів (SHA-256 від SPKI DER, перші 16 hex-символів):
+- `dev` (`kid=dev-1`): `45b58d719917aa5a`
+- `prod` (`kid=prod-1`): `9c4e18a20b7f31d4` (окремий ключ у prod-середовищі Vault, відмінний від dev)
+
+### 4. Чому логаут — це дві дії
+
+Refresh-токен є непрозорим випадковим рядком, чий HMAC-хеш (`REFRESH_TOKEN_PEPPER`) зберігається в таблиці `refresh_tokens` у PostgreSQL — тому при логауті достатньо проставити `revoked_at = now()` на всю сімʼю (`family_id`). Access-токен натомість є self-contained JWT і лишається криптографічно валідним до `exp`, тому його `jti` записується в Redis-денилист (`noeviction` інстанс із ДЗ #23) із `TTL = exp - now`. Використовується два незалежні сховища (PostgreSQL для стану сесійних сімей + Redis для ефемерного денилиста з авто-експірацією), без ілюзії атомарного dual-write.
+
+### 5. Гонка на клієнті при рефреші
+
+У цьому API обрано **серіалізацію рефрешу на клієнті** (один in-flight проміс на всі паралельні 401-запити) без grace window на сервері: будь-яке повторне предʼявлення вже використаного refresh-токена негайно трактується як компрометація й відкликає всю сімʼю (`family_id`) з логуванням `family_id`, `user_id` і `kid` (без жодних токенів у логах).
+
+### 6. Межа між гардом, власністю та роллю в токені
+
+- **Відповідність домену:** `orders` — ресурс із власником (`account_id` / `ownerUserId`); `instruments` — аналог `products`, куди можуть писати (`POST /instruments`) лише привілейовані ролі `ADMIN` або `BROKER`.
+- **Межа перевірки власності:** `JwtAuthGuard` та `RolesGuard` виконуються до завантаження сутності і перевіряють лише автентифікацію (`401`) та роль (`403`). Перевірка власності (`order.account_id === user.sub`) навмисно виконана в `OrdersService.findById` **після** завантаження ордера, бо гард не має даних ресурсу і змушений був би робити зайвий запит у БД.
+- **Роль у токені як кеш:** Поле `role` у JWT-payload є кешем на момент видачі токена, а не джерелом правди. Якщо адміністратора розжалувати в базі, він зберігатиме права `ADMIN` до завершення `exp` поточного access-токена (максимум 15 хв) або до явного логауту/відкликання.
+
 ## Grading
 
 ```bash
@@ -1058,59 +1105,83 @@ export REDIS_QUEUE_URL=redis://127.0.0.1:6380
 export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:5432/broker_db
 export SKIP_VAULT=1
 
-# 1. Компіляція чиста
-npm ci && npx tsc --noEmit
+# Одноразова пара ES256 (P-256) для прогону; PEM передається в base64
+node -e 'const {generateKeyPairSync}=require("node:crypto");
+const k=generateKeyPairSync("ec",{namedCurve:"P-256",
+  privateKeyEncoding:{type:"pkcs8",format:"pem"},
+  publicKeyEncoding:{type:"spki",format:"pem"}});
+const fs=require("node:fs");
+fs.writeFileSync("/tmp/priv.b64",Buffer.from(k.privateKey).toString("base64"));
+fs.writeFileSync("/tmp/pub.b64",Buffer.from(k.publicKey).toString("base64"));'
+
+export JWT_KID=grader
+export JWT_PRIVATE_KEY="$(cat /tmp/priv.b64)"
+export JWT_PUBLIC_KEY="$(cat /tmp/pub.b64)"
+export REFRESH_TOKEN_PEPPER=grader-pepper-at-least-32-bytes-long
+
+npm ci
 npm run migrate
 
-# 2. Кеш економить походи в базу, а лавина дає рівно один
-npm run demo:cache | tee /tmp/c.txt; echo "exit=${PIPESTATUS[0]}"
-for k in db-calls=1 db-calls-warm=0 cache-lru=1 cache-maxmemory=1; do
-  grep -qx "$k" /tmp/c.txt || echo "НЕМАЄ: $k"
-done
-awk -F= '/^concurrent=/{ok=($2>=20)} END{exit !ok}' /tmp/c.txt && echo "concurrent>=20 OK"
-awk -F= '/^warmed=/{ok=($2>=50)}      END{exit !ok}' /tmp/c.txt && echo "warmed>=50 OK"
-awk -F= '/^ttl-distinct=/{ok=($2>=5)} END{exit !ok}' /tmp/c.txt && echo "ttl-distinct>=5 OK"
+# 1. Компіляція чиста
+npx tsc --noEmit
 
-# 3. Сесія живе в Redis і подовжується при активності
-npm run demo:session | tee /tmp/s.txt; echo "exit=${PIPESTATUS[0]}"
-for k in sessions=1 in-redis=1 ttl-renewed=1; do
-  grep -qx "$k" /tmp/s.txt || echo "НЕМАЄ: $k"
-done
-awk -F= '/^requests=/{ok=($2>=3)} END{exit !ok}' /tmp/s.txt && echo "requests>=3 OK"
+# 2. Ключі йдуть через обгортку сховища
+node -e "const s=require('./package.json').scripts;const need=['start:vault','demo:auth','demo:reuse','demo:rbac'];const bad=need.filter(k=>/with-secrets\.sh/.test(s[k]||'')===false);console.log(bad.length===0?'OK':'без обгортки: '+bad.join(', '));process.exit(bad.length===0?0:1)"
+grep -q 'SKIP_VAULT' scripts/with-secrets.sh && echo "аварійний вхід є"
 
-# 4. Ліміт спільний для двох подів, 429 і Retry-After на місці
-npm run demo:ratelimit | tee /tmp/r.txt; echo "exit=${PIPESTATUS[0]}"
-for k in status=429 retry-after=1; do
+# 3. Без ключа зі сховища застосунок не стартує і називає змінну
+VARS=$(grep -rhE '^[[:space:]]*\|' --include='README.md' --exclude-dir=node_modules . \
+       | awk -F'|' '
+           { hit=0
+             for (i=2; i<=NF; i++) if ($i ~ /сховищ/) hit=i
+             if (!hit) next
+             for (i=2; i<=NF; i++) {
+               if (i==hit) continue
+               if (match($i, /`[A-Za-z_][A-Za-z0-9_]*`/)) { print substr($i, RSTART+1, RLENGTH-2); break }
+               c=$i; gsub(/[ \t*`]/, "", c)
+               if (c ~ /^[A-Za-z_][A-Za-z0-9_]*$/) { print c; break }
+             } }' | sort -u)
+echo "змінні зі сховища: $(echo $VARS)"
+node -e '
+const {spawnSync}=require("child_process");
+const vars=process.argv.slice(1);
+if (vars.length===0) { console.log("exit=— названо=— (таблиці змінних у README не знайдено)"); process.exit(1); }
+const env={...process.env}; for(const v of vars) delete env[v];
+const r=spawnSync("npm",["run","start"],{env,encoding:"utf8",timeout:60000});
+const out=(r.stdout||"")+(r.stderr||"");
+const named=vars.filter(v=>out.includes(v));
+console.log("exit="+r.status+" названо="+(named.join(",")||"—"));
+process.exit(r.status!==0 && r.status!==null && named.length>0 ? 0 : 1);
+' $VARS
+
+# 4. Логін, доступ і логаут (денилист + відкликання сімʼї)
+npm run demo:auth | tee /tmp/a.txt; echo "exit=${PIPESTATUS[0]}"
+for k in login=200 no-token=401 with-token=200 refresh=200 after-logout=401 refresh-after-logout=401; do
+  grep -qx "$k" /tmp/a.txt || echo "НЕМАЄ: $k"
+done
+awk -F= '/^logout=/{ok=($2==200||$2==204)} END{exit !ok}' /tmp/a.txt && echo "logout OK"
+
+# 5. Reuse detection валить усю сімʼю
+npm run demo:reuse | tee /tmp/r.txt; echo "exit=${PIPESTATUS[0]}"
+for k in login=200 r1-refresh=200 r1-reuse=401 r2-after-reuse=401; do
   grep -qx "$k" /tmp/r.txt || echo "НЕМАЄ: $k"
 done
-awk -F= '/^instances=/{i=$2} /^limit=/{l=$2} /^allowed=/{a=$2} /^blocked=/{b=$2}
-  END{exit !(i>=2 && l>0 && a==l && b>=1)}' /tmp/r.txt && echo "instances/allowed/blocked OK"
 
-# 5. Черга ретраїть, дедуплікує і має планувальник
-npm run demo:queue | tee /tmp/q.txt; echo "exit=${PIPESTATUS[0]}"
-for k in completed=1 added=2 queued=1 queue-noeviction=1; do
-  grep -qx "$k" /tmp/q.txt || echo "НЕМАЄ: $k"
+# 6. 401 != 403, власність, роль і перевірка підпису
+npm run demo:rbac | tee /tmp/b.txt; echo "exit=${PIPESTATUS[0]}"
+for k in anon=401 own=200 foreign=403 role-denied=403 tampered=401; do
+  grep -qx "$k" /tmp/b.txt || echo "НЕМАЄ: $k"
 done
-awk -F= '/^attempts=/{ok=($2>=3)} END{exit !ok}' /tmp/q.txt && echo "attempts>=3 OK"
-awk -F= '/^schedulers=/{ok=($2>=1)} END{exit !ok}' /tmp/q.txt && echo "schedulers>=1 OK"
-awk -F= '/^scheduled-runs=/{ok=($2>=2)} END{exit !ok}' /tmp/q.txt && echo "scheduled-runs>=2 OK"
+awk -F= '/^role-allowed=/{ok=($2==200||$2==201)} END{exit !ok}' /tmp/b.txt && echo "role-allowed OK"
 
-# 6. Кеш і черга — на різних інстансах Redis
-grep -qx 'cache-lru=1' /tmp/c.txt && grep -qx 'queue-noeviction=1' /tmp/q.txt \
-  && echo "два інстанси OK" || echo "кеш і черга на одному інстансі"
-grep -rniE --exclude-dir=node_modules --exclude-dir=dist "maxmemory[ _-]*policy|noeviction|allkeys[ _-]*lru" .
+# 7. Allowlist алгоритмів у коді верифікації
+grep -rniE --include='*.ts' --include='*.js' --exclude-dir=node_modules --exclude-dir=dist "algorithms[[:space:]]*[:=,}]|['\"]algorithms['\"]|algorithms\(" .
 
-# 7. Усі чотири демо ходять у Redis через обгортку зі сховищем
-node -e "const s=require('./package.json').scripts;const bad=['demo:cache','demo:session','demo:ratelimit','demo:queue'].filter(k=>/with-secrets\.sh/.test(s[k]||'')===false);console.log(bad.length===0?'OK':'без обгортки: '+bad.join(', '));process.exit(bad.length===0?0:1)"
-
-# 8. Наявність розділу Grading у README
+# 8. Розділи ## Grading і ## Auth у README
 grep -rlE '^#{1,3} +Grading' --include='README.md' --exclude-dir=node_modules . | wc -l
-
-# 9. Відсутність трекнутих env-файлів з живим рядком підключення
-for f in $(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -vE '\.(example|sample|template|dist)$'); do
-  grep -lE '=(amqps?|postgres(ql)?|redis|https?)://[^ ]*:[^ @]+@' "$f"
-done
+grep -rlE '^#{1,3} +Auth' --include='README.md' --exclude-dir=node_modules . | wc -l
 ```
+
 
 
 

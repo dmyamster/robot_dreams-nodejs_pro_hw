@@ -1,10 +1,17 @@
 import { Verifier, VerifierOptions } from '@pact-foundation/pact';
 import { createNestApp } from '../../src/app.factory';
+import { JwtService } from '../../src/auth/jwt.service';
 import * as path from 'node:path';
 
 describe('Pact Provider Verification', () => {
   it('should verify provider against consumer contracts', async () => {
     const app = await createNestApp();
+    const jwtService = app.get(JwtService);
+    const { token } = jwtService.signAccessToken({
+      sub: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+      email: 'pact-verifier@broker.test',
+      role: 'ADMIN',
+    });
     const server = await app.listen(0);
     const address = server.address() as any;
     const port = address.port;
@@ -22,6 +29,12 @@ describe('Pact Provider Verification', () => {
       provider: 'PaperTradingBrokerApi',
       providerBaseUrl,
       logLevel: 'info',
+      requestFilter: (req, _res, next) => {
+        if (!req.headers.authorization) {
+          req.headers.authorization = `Bearer ${token}`;
+        }
+        next();
+      },
       stateHandlers: {
         'an order with ID a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 exists': async () => {
           return { description: 'Order a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 is available' };
