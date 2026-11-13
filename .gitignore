@@ -8,3 +8,6 @@ secrets/*
 !secrets/*.example
 .secrets/
 backups/*.dump
+.npm_token
+.pulumi/
+infra/node_modules/
