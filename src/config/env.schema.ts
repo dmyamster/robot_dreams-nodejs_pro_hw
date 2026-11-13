@@ -22,6 +22,9 @@ export const envSchema = z.object({
   STORAGE_ACCESS_KEY: z.string().min(1, 'STORAGE_ACCESS_KEY is required (from vault)'),
   STORAGE_SECRET_KEY: z.string().min(1, 'STORAGE_SECRET_KEY is required (from vault)'),
   PRESIGNED_PUT_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+  STARTUP_WARMUP_MS: z.coerce.number().int().min(0).default(0),
+  DRAIN_DELAY_MS: z.coerce.number().int().min(0).default(5000),
+  REV: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

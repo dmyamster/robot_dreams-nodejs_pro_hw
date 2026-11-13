@@ -1,0 +1,7 @@
+config:
+  broker-k8s:namespace: broker-hw28
+  broker-k8s:image: broker-api:hw28
+  broker-k8s:replicas: "2"
+  broker-k8s:profile: hardened
+  broker-k8s:rev: "1"
+encryptionsalt: v1:kgemzU+f9Mw=:v1:jLeR9puntifjo2xF:D/4PxOyWd9Im/0C3AgSRTYKUw8MkJg==

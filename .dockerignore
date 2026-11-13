@@ -4,4 +4,10 @@ dist
 .env
 secrets
 secrets/
+.secrets
+.npm_token
+.pulumi
+infra
+k8s
+demo
 *.log
