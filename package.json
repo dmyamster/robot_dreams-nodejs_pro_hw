@@ -30,6 +30,9 @@
     "demo:auth": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-auth.js",
     "demo:reuse": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-reuse.js",
     "demo:rbac": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-rbac.js",
+    "demo:upload": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-upload.js",
+    "demo:multipart": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-multipart.js",
+    "demo:cdn": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-cdn.js",
     "report": "bash scripts/with-secrets.sh dev node dist/src/report.js",
     "backup": "bash scripts/with-secrets.sh dev bash scripts/backup.sh",
     "restore:drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh",
@@ -44,6 +47,8 @@
     "test": "npm run lint:spec && npm run check:criteria && node --no-warnings --experimental-strip-types test/run-all-tests.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1168.0",
+    "@aws-sdk/s3-request-presigner": "^3.1168.0",
     "@nestjs/common": "^11.0.0",
     "@nestjs/config": "^12.0.1",
     "@nestjs/core": "^11.0.0",

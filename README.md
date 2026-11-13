@@ -1095,6 +1095,67 @@ Refresh-токен є непрозорим випадковим рядком, ч
 - **Межа перевірки власності:** `JwtAuthGuard` та `RolesGuard` виконуються до завантаження сутності і перевіряють лише автентифікацію (`401`) та роль (`403`). Перевірка власності (`order.account_id === user.sub`) навмисно виконана в `OrdersService.findById` **після** завантаження ордера, бо гард не має даних ресурсу і змушений був би робити зайвий запит у БД.
 - **Роль у токені як кеш:** Поле `role` у JWT-payload є кешем на момент видачі токена, а не джерелом правди. Якщо адміністратора розжалувати в базі, він зберігатиме права `ADMIN` до завершення `exp` поточного access-токена (максимум 15 хв) або до явного логауту/відкликання.
 
+## Files
+
+### Змінні оточення
+
+| Змінна | Опис | Джерело |
+| --- | --- | --- |
+| `STORAGE_ENDPOINT` | Endpoint S3-сумісного сховища (порожньо для AWS S3) | env / `.env` |
+| `STORAGE_REGION` | Регіон сховища (`us-east-1`) | env / `.env` |
+| `STORAGE_BUCKET` | Імʼя приватного бакета (`hw26-files`) | env / `.env` |
+| `STORAGE_ACCESS_KEY` | Access Key сховища | сховище (Infisical / `with-secrets.sh`) |
+| `STORAGE_SECRET_KEY` | Secret Key сховища | сховище (Infisical / `with-secrets.sh`) |
+| `PRESIGNED_PUT_TTL_SECONDS` | Строк дії presigned PUT URL у секундах (`300`) | env / `.env` |
+
+### Свідомі рішення та обґрунтування
+
+1. **Строк presigned URL (`300` секунд / 5 хвилин для PUT, `60` секунд для `GET /files/:id` 302-редіректа).**
+   Presigned URL не можна відкликати — він не має `jti` чи реєстру, а `expiresIn: 7d` у продакшені під STS-роллю часто помирає через 1 годину разом із тимчасовими креденшелами. Для завантаження аватарки чи документа з форми 5 хвилин достатньо на старт PUT-запиту, і водночас це мінімізує вікно ризику при витоку URL. Для читання `GET /files/:id` виконує перевірку права доступу (JwtAuthGuard + власність/роль) і видає 302-редірект на presigned GET на 60 секунд; повний presigned URL ніколи не логується.
+
+2. **Двокроковий контракт і серверний ключ (`uploads/{userId}/{uuid}.{ext}`).**
+   `POST /api/v1/uploads/intent` валідує `contentType` за allowlist (`image/jpeg`, `image/png`, `image/webp`, `application/pdf`, `application/octet-stream`, `text/css`, `application/javascript`, `text/plain`, `application/gzip`) і генерує ключ на сервері. Клієнтський `filename` (наприклад, `../../etc/passwd`) у ключ не потрапляє. У БД створюється запис `files` зі статусом `PENDING`. `POST /api/v1/uploads/commit` робить `HeadObject` у сховищі й звіряє існування та розмір обʼєкта; без фізичних байтів у сховищі повертається `409 Conflict`, а статус `COMPLETED` ставиться лише після підтвердження. Завислі `PENDING`-записи старші за 24 години доцільно прибирати фоновим BullMQ-воркером (`AbortMultipartUpload` → `DeleteObject` → видалення рядка), а на бакеті тримати lifecycle-правило `AbortIncompleteMultipartUpload: 7 days`.
+
+3. **Поріг multipart та розрахунок розміру частини.**
+   Поріг увімкнення multipart — `10 MiB` (`2 × 5 MiB`, щоб при спрацьовуванні було щонайменше 2 частини). Мінімальний розмір нефінальної частини в S3 — `5 MiB`, а максимум частин — `10 000`. Тому розмір частини обчислюється динамічно:
+   `partSize = Math.max(5 * 1024 * 1024, Math.ceil(fileSize / 10_000))`.
+   При обриві новий процес викликає `GET /api/v1/uploads/:id/parts` (всередині `ListPartsCommand`) і довантажує лише відсутні частини перед `POST /api/v1/uploads/:id/complete` (`CompleteMultipartUploadCommand`).
+
+4. **Форма CDN та оновлення без інвалідації.**
+   Обрана локальна форма OAC-стилю: легкий edge-сервер (`src/files/edge-cdn.ts`), який ходить у приватний бакет MinIO/S3 власними креденшелами, кешує відповіді в памʼяті лише за наявності origin-заголовка `Cache-Control: public, max-age=31536000, immutable` (без `Cache-Control` від origin кешування не відбувається) і віддає `X-Cache: HIT|MISS`. Ассети публікуються з контент-хешем в імені (`app.<sha256-8>.css`), тож після деплою новий вміст приїжджає під новим URL без жодної інвалідації. Для приватного контенту на справжньому CloudFront додатково застосовуються CloudFront Signed URLs або Signed Cookies.
+
+5. **Bucket Policy для AWS CloudFront + OAC (довідкова конфігурація):**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontServicePrincipalReadOnly",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudfront.amazonaws.com"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::hw26-files/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::123456789012:distribution/E1234567890ABC"
+        }
+      }
+    }
+  ]
+}
+```
+
+### Результати трьох прогонів
+
+- `npm run demo:upload`:
+  `intent=200`, `key-from-server=1`, `api-alive=0`, `put-offline=200`, `commit=200`, `commit-without-bytes=409`, `tampered=403`, `expired=403`
+- `npm run demo:multipart` (прогін 1 і 2):
+  `head-before-complete=404`, `resumed-parts=1`, `complete=200`, `size-match=1`, `etag-multipart=1`
+- `npm run demo:cdn`:
+  `direct=403`, `edge-miss=200`, `edge-hit=200`, `cache-hit=1`, `new-name=1`, `new-url=200`, `content-changed=1`
+
 ## Grading
 
 ```bash
@@ -1103,6 +1164,11 @@ docker compose up -d --wait
 export REDIS_URL=redis://127.0.0.1:6379
 export REDIS_QUEUE_URL=redis://127.0.0.1:6380
 export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:5432/broker_db
+export STORAGE_ENDPOINT=http://127.0.0.1:22650
+export STORAGE_REGION=us-east-1
+export STORAGE_BUCKET=hw26-files
+export STORAGE_ACCESS_KEY=hw26user
+export STORAGE_SECRET_KEY=hw26secretpass
 export SKIP_VAULT=1
 
 # Одноразова пара ES256 (P-256) для прогону; PEM передається в base64
@@ -1180,6 +1246,36 @@ grep -rniE --include='*.ts' --include='*.js' --exclude-dir=node_modules --exclud
 # 8. Розділи ## Grading і ## Auth у README
 grep -rlE '^#{1,3} +Grading' --include='README.md' --exclude-dir=node_modules . | wc -l
 grep -rlE '^#{1,3} +Auth' --include='README.md' --exclude-dir=node_modules . | wc -l
+
+# --- ДЗ #26: Object Storage, Presigned, Multipart, CDN ---
+
+# 26.2. Креденшели сховища через with-secrets.sh
+node -e "const s=require('./package.json').scripts;const need=['demo:upload','demo:multipart','demo:cdn'];const bad=need.filter(k=>/with-secrets\.sh/.test(s[k]||'')===false);console.log(bad.length===0?'OK':'без обгортки: '+bad.join(', '));process.exit(bad.length===0?0:1)"
+grep -q 'SKIP_VAULT' scripts/with-secrets.sh && echo "аварійний вхід є"
+
+# 26.3. Presigned upload (байти повз API)
+npm run demo:upload | tee /tmp/u.txt; echo "exit=${PIPESTATUS[0]}"
+for k in intent=200 key-from-server=1 api-alive=0 put-offline=200 commit=200 tampered=403 expired=403; do
+  grep -qx "$k" /tmp/u.txt || echo "НЕМАЄ: $k"
+done
+awk -F= '/^commit-without-bytes=/{o=($2>=400 && $2<500)} END{exit !o}' /tmp/u.txt && echo "commit-without-bytes 4xx OK"
+
+# 26.4. Multipart із довантаженням (два прогони поспіль)
+for run in 1 2; do
+  npm run demo:multipart | tee /tmp/m$run.txt; echo "прогін $run exit=${PIPESTATUS[0]}"
+  for k in head-before-complete=404 resumed-parts=1 complete=200 size-match=1 etag-multipart=1; do
+    grep -qx "$k" /tmp/m$run.txt || echo "прогін $run НЕМАЄ: $k"
+  done
+done
+
+# 26.5. Приватний бакет, кеш-шар, оновлення без інвалідації
+npm run demo:cdn | tee /tmp/c.txt; echo "exit=${PIPESTATUS[0]}"
+for k in direct=403 edge-miss=200 edge-hit=200 cache-hit=1 new-name=1 new-url=200 content-changed=1; do
+  grep -qx "$k" /tmp/c.txt || echo "НЕМАЄ: $k"
+done
+
+# 26.7. Розділ ## Files у README
+grep -rlE '^#{1,3} +(Files|Файли)' --include='README.md' --exclude-dir=node_modules . | wc -l
 ```
 
 

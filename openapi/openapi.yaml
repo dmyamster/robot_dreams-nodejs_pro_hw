@@ -391,6 +391,272 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
 
+  /uploads/intent:
+    post:
+      operationId: createUploadIntent
+      summary: Створення наміру завантаження файлу (presigned URL або multipart)
+      description: Генерує ключ об'єкта на сервері, записує PENDING у БД та повертає presigned URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contentType]
+              properties:
+                contentType:
+                  type: string
+                  minLength: 1
+                filename:
+                  type: string
+                size:
+                  type: integer
+                  minimum: 0
+      responses:
+        '200':
+          description: Намір створено
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [fileId, key, mode, expiresIn]
+                properties:
+                  fileId:
+                    type: string
+                    format: uuid
+                  key:
+                    type: string
+                  mode:
+                    type: string
+                    enum: [single, multipart]
+                  uploadUrl:
+                    type: string
+                  uploadId:
+                    type: string
+                  partSize:
+                    type: integer
+                  partCount:
+                    type: integer
+                  expiresIn:
+                    type: integer
+                  parts:
+                    type: array
+                    items:
+                      type: object
+                      required: [partNumber, uploadUrl]
+                      properties:
+                        partNumber:
+                          type: integer
+                        uploadUrl:
+                          type: string
+        '400':
+          description: Невалідний contentType або параметри
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: Не автентифіковано
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /uploads/commit:
+    post:
+      operationId: commitUpload
+      summary: Підтвердження завантаження (HeadObject -> COMPLETED)
+      description: Перевіряє існування та розмір об'єкта у сховищі через HeadObject і переводить статус у COMPLETED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fileId]
+              properties:
+                fileId:
+                  type: string
+                  format: uuid
+      responses:
+        '200':
+          description: Завантаження підтверджено
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [fileId, key, status, size]
+                properties:
+                  fileId:
+                    type: string
+                    format: uuid
+                  key:
+                    type: string
+                  status:
+                    type: string
+                  size:
+                    type: integer
+                  etag:
+                    type: string
+                    nullable: true
+        '401':
+          description: Не автентифіковано
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Файл не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Об'єкт відсутній у сховищі або розмір не збігається
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /uploads/{id}/parts:
+    get:
+      operationId: getMultipartParts
+      summary: Список завантажених і відсутніх частин multipart
+      description: Викликає ListParts у сховищі й повертає presigned URL лише для відсутніх частин.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Інформація про частини
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [fileId, key, uploadId, partSize, partCount, uploadedParts, missingParts]
+                properties:
+                  fileId:
+                    type: string
+                    format: uuid
+                  key:
+                    type: string
+                  uploadId:
+                    type: string
+                  partSize:
+                    type: integer
+                  partCount:
+                    type: integer
+                  uploadedParts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        partNumber:
+                          type: integer
+                        etag:
+                          type: string
+                        size:
+                          type: integer
+                  missingParts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        partNumber:
+                          type: integer
+                        uploadUrl:
+                          type: string
+        '401':
+          description: Не автентифіковано
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /uploads/{id}/complete:
+    post:
+      operationId: completeMultipartUpload
+      summary: Завершення multipart-завантаження
+      description: Збирає завантажені частини через CompleteMultipartUpload, перевіряє HeadObject і переводить у COMPLETED.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Multipart завершено
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [fileId, key, status, size]
+                properties:
+                  fileId:
+                    type: string
+                    format: uuid
+                  key:
+                    type: string
+                  status:
+                    type: string
+                  size:
+                    type: integer
+                  etag:
+                    type: string
+                    nullable: true
+        '401':
+          description: Не автентифіковано
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Частини не завантажені або розмір не збігається
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /files/{id}:
+    get:
+      operationId: downloadFile
+      summary: Отримання файлу через 302 редірект на короткоживучий presigned URL
+      description: Перевіряє право доступу й повертає 302 Found на presigned GET URL.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '302':
+          description: Редірект на presigned GET URL
+        '401':
+          description: Не автентифіковано
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Доступ заборонено
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Файл не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
 components:
   schemas:
     TokenPairResponse:
