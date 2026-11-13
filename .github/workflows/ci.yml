@@ -106,3 +106,31 @@ jobs:
             console.error("❌ can-i-deploy failed:", res?.summary?.reason || "not deployable");
             process.exit(1);
           ' "$RESPONSE"
+
+  container-scan:
+    name: Container Build & Vulnerability Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update && sudo apt-get install -y wget apt-transport-https gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      - name: Build production image with BuildKit secret
+        run: |
+          printf 'ci-dummy-npm-token' > .npm_token
+          npm run image:build
+
+      - name: Run vulnerability scan gate
+        env:
+          SCAN_MAX: '50'
+        run: npm run scan

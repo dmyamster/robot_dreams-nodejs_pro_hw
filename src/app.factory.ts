@@ -24,7 +24,7 @@ export function configureApp(app: INestApplication): INestApplication {
   });
 
   app.setGlobalPrefix('api/v1', {
-    exclude: ['health', 'api/v1/health'],
+    exclude: ['health', 'api/v1/health', 'healthz', 'readyz'],
   });
 
   app.use(express.json());
@@ -39,6 +39,7 @@ export function configureApp(app: INestApplication): INestApplication {
       validateResponses: true,
       ignorePaths: (reqPath: string) =>
         reqPath.includes('health') ||
+        reqPath.includes('readyz') ||
         reqPath.includes('events') ||
         reqPath.includes('status'),
     }),

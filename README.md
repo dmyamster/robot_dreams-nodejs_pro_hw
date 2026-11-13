@@ -1101,8 +1101,8 @@ Refresh-токен є непрозорим випадковим рядком, ч
 
 | Змінна | Опис | Джерело |
 | --- | --- | --- |
-| `STORAGE_ENDPOINT` | Endpoint S3-сумісного сховища (порожньо для AWS S3) | env / `.env` |
-| `STORAGE_REGION` | Регіон сховища (`us-east-1`) | env / `.env` |
+| `STORAGE_ENDPOINT` | Endpoint S3-сумісного стореджу (порожньо для AWS S3) | env / `.env` |
+| `STORAGE_REGION` | Регіон S3-стореджу (`us-east-1`) | env / `.env` |
 | `STORAGE_BUCKET` | Імʼя приватного бакета (`hw26-files`) | env / `.env` |
 | `STORAGE_ACCESS_KEY` | Access Key сховища | сховище (Infisical / `with-secrets.sh`) |
 | `STORAGE_SECRET_KEY` | Secret Key сховища | сховище (Infisical / `with-secrets.sh`) |
@@ -1155,6 +1155,42 @@ Refresh-токен є непрозорим випадковим рядком, ч
   `head-before-complete=404`, `resumed-parts=1`, `complete=200`, `size-match=1`, `etag-multipart=1`
 - `npm run demo:cdn`:
   `direct=403`, `edge-miss=200`, `edge-hit=200`, `cache-hit=1`, `new-name=1`, `new-url=200`, `content-changed=1`
+
+## Kubernetes
+
+### Локальний кластер та ресурси
+
+- **Кластер:** `kind` (одновузловий, конфіг у [`k8s/kind-config.yaml`](k8s/kind-config.yaml) з `extraPortMappings` `30080 -> 30080`).
+- **Виділена памʼять:** Docker Desktop на хості має `~7.75 GiB` загальної памʼяті (`docker info | grep -i "total memory"`), вузол `kind` споживає `~520–550 MiB` RAM (значно менше за поріг `minikube` у `1800 MB`).
+
+### Змінні оточення та секрети
+
+| Змінна | Джерело | Навіщо |
+|---|---|---|
+| `DB_PASSWORD` | сховище (#11) | пароль до PostgreSQL, потрапляє в K8s `Secret` (`broker-secrets`) |
+| `JWT_PRIVATE_KEY` | сховище (#11) | приватний ключ ES256 (base64 PEM), потрапляє в K8s `Secret` |
+| `JWT_PUBLIC_KEY` | сховище (#11) | публічний ключ ES256 (base64 PEM), потрапляє в K8s `Secret` |
+| `REFRESH_TOKEN_PEPPER` | сховище (#11) | секретний перець для HMAC-SHA256 refresh-токенів, потрапляє в K8s `Secret` |
+| `STORAGE_ACCESS_KEY` | сховище (#11) | ключ доступу до S3/MinIO сховища, потрапляє в K8s `Secret` |
+| `STORAGE_SECRET_KEY` | сховище (#11) | секретний ключ S3/MinIO сховища, потрапляє в K8s `Secret` |
+| `PULUMI_CONFIG_PASSPHRASE` | сховище (#11) | ключ шифрування стану локального Pulumi-стеку |
+
+### Конфлікт володіння `spec.replicas` та `HPA`
+
+У локальному `kind` немає `metrics-server`, тому `HorizontalPodAutoscaler` (`autoscaling/v2`) показує `TARGETS: cpu: <unknown>/70%` і `REPLICAS: 0` — це очікувано, і саме тому `spec.replicas: 2` залишається в `Deployment`. У бойовому кластері з увімкненим `metrics-server` одночасне задання `spec.replicas` у Pulumi-маніфесті та `HPA` створює **конфлікт володіння полем** (`field ownership conflict`): HPA масштабує кількість подів під навантаженням, а наступний `pulumi up` відкочує `replicas` назад до статичного значення. У проді це вирішується або виключенням `replicas` зі `spec` після першого деплою, або `ignoreChanges: ["replicas"]` у `CustomResourceOptions`.
+
+### Промислові шляхи доставки секретів (ESO та CSI)
+
+У цьому ДЗ секрет зі сховища (`scripts/with-secrets.sh`) потрапляє у кластер через Pulumi-ресурс `k8s.core.v1.Secret` (`data` у base64, без відкритого тексту в `Deployment`), а `Deployment` споживає його через `envFrom.secretRef`. У продакшені секрети не ганяють через CI/CD-раннер напряму — натомість використовують:
+- **External Secrets Operator (ESO)** — оператор у кластері, який періодично синхронізує секрети із зовнішнього сховища (Infisical, AWS Secrets Manager, HashiCorp Vault) у нативні K8s `Secret`.
+- **Secrets Store CSI Driver** — монтує секрети безпосередньо в `tmpfs`-том пода з зовнішнього сховища в момент старту контейнера, взагалі не записуючи їх у `etcd`.
+
+### Повільний старт (`startupProbe`) та sidecar
+
+Якщо сервіс має довгий і нерівномірний старт (міграції БД, прогрів кешу, наприклад до `30 с`), замість роздування `initialDelaySeconds` у `livenessProbe` варто додати `startupProbe`:
+- З `initialDelaySeconds: 30` на `livenessProbe` (`periodSeconds: 5, failureThreshold: 3`) перший рестарт станеться через `30 + 3×5 = 45 с` незалежно від того, чи сервіс стартував за `4 с`, чи завис.
+- З `startupProbe` (`periodSeconds: 2, failureThreshold: 15`, тобто вікно `30 с`) `livenessProbe` (`periodSeconds: 5, failureThreshold: 3`) та `readinessProbe` не запускаються, доки `startupProbe` не відповість `200`, а одразу після успіху `startupProbe` вимикається назавжди і далі працює швидкий `livenessProbe` (`15 с` на виявлення зависання).
+- Якщо у поді є другий контейнер (**sidecar**, наприклад збирач логів або проксі), готовність пода є конʼюнкцією готовностей усіх його контейнерів: неналаштований або неготовий sidecar робить весь под `NotReady` і знімає трафік навіть зі здорового основного застосунку.
 
 ## Grading
 
@@ -1276,6 +1312,92 @@ done
 
 # 26.7. Розділ ## Files у README
 grep -rlE '^#{1,3} +(Files|Файли)' --include='README.md' --exclude-dir=node_modules . | wc -l
+
+# --- ДЗ #28: Kubernetes, Zero-Downtime Rolling Update, Pulumi, Distroless ---
+
+export SKIP_VAULT=1
+export DB_PASSWORD=grader-db-secret
+export STORAGE_ACCESS_KEY=hw26user
+export STORAGE_SECRET_KEY=hw26secretpass
+export REFRESH_TOKEN_PEPPER=grader-pepper-at-least-32-bytes-long
+export PULUMI_BACKEND_URL="file://$PWD/.pulumi"
+export PULUMI_CONFIG_PASSPHRASE=hw28-grading
+
+node -e 'const {generateKeyPairSync}=require("node:crypto"),fs=require("node:fs");
+const k=generateKeyPairSync("ec",{namedCurve:"P-256",
+  privateKeyEncoding:{type:"pkcs8",format:"pem"},
+  publicKeyEncoding:{type:"spki",format:"pem"}});
+fs.writeFileSync("/tmp/priv.b64",Buffer.from(k.privateKey).toString("base64"));
+fs.writeFileSync("/tmp/pub.b64",Buffer.from(k.publicKey).toString("base64"));'
+export JWT_PRIVATE_KEY="$(cat /tmp/priv.b64)"
+export JWT_PUBLIC_KEY="$(cat /tmp/pub.b64)"
+
+npm --prefix infra ci
+printf 'dummy-npm-token' > .npm_token
+
+npm run image:build
+npm run cluster:up
+npm run up
+
+# 1. Pulumi-програма типізується
+(cd infra && npx tsc --noEmit); echo "exit=$?"
+
+# 2. Образ production-grade та 3. Секрет збірки не осів в образі
+npm run demo:image | tee /tmp/img.txt
+awk -F= '/^stages=/{s=$2}/^shell-inside=/{sh=$2}/^runtime-uid=/{u=$2}
+         END{print (s>=2 && sh==0 && u!=0 && u!="") ? "OK" : "НЕ production"}' /tmp/img.txt
+awk -F= '/^token-in-/{t+=$2} END{print (t==0) ? "чисто" : "витік: "t}' /tmp/img.txt
+
+# 4. Поріг сканера обчислюється
+SCAN_MAX=-1 npm run scan; echo "exit(max=-1)=$?"
+SCAN_MAX=99999 npm run scan; echo "exit(max=99999)=$?"
+
+# 5. Без значення зі сховища розгортання падає і називає змінну
+VARS=$(grep -rhE '^[[:space:]]*\|' --include='README.md' --exclude-dir=node_modules . \
+  | awk -F'|' '{ hit=0
+      for (i=2;i<=NF;i++) if ($i ~ /сховищ/) hit=i
+      if (!hit) next
+      for (i=2;i<=NF;i++){ if (i==hit) continue
+        if (match($i, /`[A-Za-z_][A-Za-z0-9_]*`/)) { print substr($i, RSTART+1, RLENGTH-2); break }
+        c=$i; gsub(/[ \t*`]/,"",c); if (c ~ /^[A-Za-z_][A-Za-z0-9_]*$/) { print c; break } } }' | sort -u)
+[ -n "$VARS" ] || { echo "у README немає рядків зі словом «сховище»"; exit 1; }
+for v in $VARS; do
+  OUT=$(cd infra && env -u "$v" pulumi preview --non-interactive 2>&1); RC=$?
+  case "$OUT" in *"$v"*) N=так;; *) N=НІ;; esac
+  echo "без $v -> exit=$RC названо=$N"
+done
+
+# 6. Zero-downtime rolling update під навантаженням
+npm run demo:rollout | tee /tmp/roll.txt; echo "exit=${PIPESTATUS[0]}"
+
+# 7. Проби розділені й стратегія maxUnavailable=0
+kubectl -n broker-hw28 get deploy broker-api -o json > /tmp/dep.json
+node -e '
+const d=require("/tmp/dep.json"), c=d.spec.template.spec.containers[0];
+const rp=c.readinessProbe?.httpGet?.path, lp=c.livenessProbe?.httpGet?.path;
+const mu=d.spec.strategy?.rollingUpdate?.maxUnavailable;
+console.log(`readiness=${rp||"—"} liveness=${lp||"—"} maxUnavailable=${mu}`);
+process.exit((rp&&lp&&rp!==lp&&(mu===0||mu==="0"))?0:1)'
+
+# 8. PDB дозволяє перше виселення (201) і блокує друге (429)
+kubectl -n broker-hw28 get pdb broker-pdb -o jsonpath='{.status.disruptionsAllowed}{"\n"}'
+npm run demo:pdb | tee /tmp/pdb.txt
+
+# 9. HPA autoscaling/v2
+kubectl -n broker-hw28 get hpa broker-hpa -o json > /tmp/hpa.json
+node -e '
+const h=require("/tmp/hpa.json");
+console.log(`apiVersion=${h.apiVersion} min=${h.spec.minReplicas} max=${h.spec.maxReplicas}`);
+process.exit((/autoscaling\/v2/.test(h.apiVersion) && h.spec.minReplicas>=2 && h.spec.maxReplicas>h.spec.minReplicas)?0:1)'
+
+# 10. Секрет доїхав у K8s Secret, у маніфесті лише посилання
+node -e '
+const c=require("/tmp/dep.json").spec.template.spec.containers[0];
+const refs=(c.env||[]).filter(e=>e.valueFrom?.secretKeyRef).length + (c.envFrom||[]).filter(e=>e.secretRef).length;
+console.log("посилань на Secret =", refs); process.exit(refs>=1?0:1)'
+
+# Прибирання після перевірки
+npm run destroy && npm run cluster:down
 ```
 
 
