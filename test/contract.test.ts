@@ -2,6 +2,9 @@ import assert from 'node:assert';
 
 const PORT = process.env.PORT || 3000;
 const baseUrl = `http://localhost:${PORT}/api/v1`;
+const authHeaders: Record<string, string> = process.env.TEST_AUTH_TOKEN
+  ? { Authorization: `Bearer ${process.env.TEST_AUTH_TOKEN}` }
+  : {};
 
 interface ProblemResponse {
   type: string;
@@ -34,7 +37,7 @@ async function runTests(): Promise<void> {
   console.log("Тест 1: POST /orders без Idempotency-Key...");
   const res1 = await fetch(`${baseUrl}/orders`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders },
     body: JSON.stringify({
       symbol: 'AAPL',
       side: 'BUY',
@@ -61,6 +64,7 @@ async function runTests(): Promise<void> {
   const res2 = await fetch(`${baseUrl}/orders`, {
     method: 'POST',
     headers: {
+      ...authHeaders,
       'Content-Type': 'application/json',
       'Idempotency-Key': '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d',
     },
@@ -93,6 +97,7 @@ async function runTests(): Promise<void> {
   const res3 = await fetch(`${baseUrl}/orders`, {
     method: 'POST',
     headers: {
+      ...authHeaders,
       'Content-Type': 'application/json',
       'Idempotency-Key': validKey,
     },
@@ -110,6 +115,7 @@ async function runTests(): Promise<void> {
   const res4 = await fetch(`${baseUrl}/orders`, {
     method: 'POST',
     headers: {
+      ...authHeaders,
       'Content-Type': 'application/json',
       'Idempotency-Key': validKey,
     },
@@ -124,6 +130,7 @@ async function runTests(): Promise<void> {
   const res5 = await fetch(`${baseUrl}/orders`, {
     method: 'POST',
     headers: {
+      ...authHeaders,
       'Content-Type': 'application/json',
       'Idempotency-Key': validKey,
     },
@@ -152,6 +159,7 @@ async function runTests(): Promise<void> {
   const res7 = await fetch(`${baseUrl}/orders`, {
     method: 'POST',
     headers: {
+      ...authHeaders,
       'Content-Type': 'application/json',
       'Idempotency-Key': '77777777-7777-7777-7777-777777777777',
     },
@@ -173,7 +181,9 @@ async function runTests(): Promise<void> {
 
   // Тест 8: Cursor-пагінація GET /orders?limit=2
   console.log("Тест 8: Cursor-пагінація GET /orders?limit=2...");
-  const res8 = await fetch(`${baseUrl}/orders?limit=2`);
+  const res8 = await fetch(`${baseUrl}/orders?limit=2`, {
+    headers: { ...authHeaders },
+  });
   assert.strictEqual(res8.status, 200);
   const body8 = (await res8.json()) as { items: OrderResponse[]; next_cursor: string | null };
   assert.strictEqual(body8.items.length, 2, 'Має повернути рівно limit=2 ордерів');

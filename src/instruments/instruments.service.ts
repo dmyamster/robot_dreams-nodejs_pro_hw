@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 export interface StockInstrument {
   symbol: string;
@@ -7,6 +7,15 @@ export interface StockInstrument {
   sector: string;
   trading_status: 'ACTIVE' | 'HALTED';
   logo_url: string | null;
+}
+
+export interface CreateInstrumentDto {
+  symbol: string;
+  company_name: string;
+  current_price_cents: number;
+  sector: string;
+  trading_status?: 'ACTIVE' | 'HALTED';
+  logo_url?: string | null;
 }
 
 @Injectable()
@@ -63,5 +72,25 @@ export class InstrumentsService {
       throw new NotFoundException(`Instrument with symbol '${symbol}' not found`);
     }
     return instrument;
+  }
+
+  create(dto: CreateInstrumentDto): StockInstrument {
+    const upperSymbol = dto.symbol.toUpperCase();
+    const existing = this.instruments.find((i) => i.symbol === upperSymbol);
+    if (existing) {
+      // Idempotent upsert-like behavior or conflict; let's update & return or throw Conflict
+      throw new ConflictException(`Instrument '${upperSymbol}' already exists`);
+    }
+
+    const created: StockInstrument = {
+      symbol: upperSymbol,
+      company_name: dto.company_name,
+      current_price_cents: dto.current_price_cents,
+      sector: dto.sector,
+      trading_status: dto.trading_status ?? 'ACTIVE',
+      logo_url: dto.logo_url ?? null,
+    };
+    this.instruments.push(created);
+    return created;
   }
 }

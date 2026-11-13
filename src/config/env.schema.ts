@@ -8,6 +8,14 @@ export const envSchema = z.object({
   BROKER_URL: z.string().default('amqp://app:app@127.0.0.1:5672'),
   REDIS_URL: z.string().default('redis://127.0.0.1:6379'),
   REDIS_QUEUE_URL: z.string().default('redis://127.0.0.1:6380'),
+  JWT_PRIVATE_KEY: z.string().min(1, 'JWT_PRIVATE_KEY is required (from vault)'),
+  JWT_PUBLIC_KEY: z.string().min(1, 'JWT_PUBLIC_KEY is required (from vault)'),
+  REFRESH_TOKEN_PEPPER: z.string().min(1, 'REFRESH_TOKEN_PEPPER is required (from vault)'),
+  JWT_KID: z.string().min(1).default('dev-1'),
+  JWT_ISSUER: z.string().min(1).default('paper-trading-broker-api'),
+  JWT_AUDIENCE: z.string().min(1).default('paper-trading-clients'),
+  ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(900),
+  REFRESH_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(604800),
 });
 
 export type Env = z.infer<typeof envSchema>;

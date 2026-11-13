@@ -1,6 +1,26 @@
 import { spawn } from 'node:child_process';
+import { generateKeyPairSync } from 'node:crypto';
+
+function ensureTestAuthEnv(): void {
+  if (!process.env.JWT_PRIVATE_KEY || !process.env.JWT_PUBLIC_KEY) {
+    const { privateKey, publicKey } = generateKeyPairSync('ec', {
+      namedCurve: 'P-256',
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+    process.env.JWT_PRIVATE_KEY = Buffer.from(privateKey).toString('base64');
+    process.env.JWT_PUBLIC_KEY = Buffer.from(publicKey).toString('base64');
+  }
+  if (!process.env.REFRESH_TOKEN_PEPPER) {
+    process.env.REFRESH_TOKEN_PEPPER = 'test-pepper-at-least-32-bytes-long-1234';
+  }
+  if (!process.env.JWT_KID) {
+    process.env.JWT_KID = 'test-1';
+  }
+}
 
 async function main(): Promise<void> {
+  ensureTestAuthEnv();
   console.log('📦 Збірка проєкту (nest build)...');
   const build = spawn('npx', ['nest', 'build'], { stdio: 'inherit' });
   await new Promise<void>((resolve, reject) => {
@@ -19,8 +39,17 @@ async function main(): Promise<void> {
 
   console.log(`🚀 NestJS додаток піднято на порті ${port} для тестів...`);
 
+  const jwtDistPath = '../dist/src/auth/jwt.service.js';
+  const { JwtService } = await import(jwtDistPath);
+  const jwtService = app.get(JwtService);
+  const { token } = jwtService.signAccessToken({
+    sub: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+    email: 'contract-test@broker.test',
+    role: 'ADMIN',
+  });
+
   const test = spawn('node', ['--no-warnings', '--experimental-strip-types', 'test/contract.test.ts'], {
-    env: { ...process.env, PORT: String(port) },
+    env: { ...process.env, PORT: String(port), TEST_AUTH_TOKEN: token },
     stdio: 'inherit',
   });
 
