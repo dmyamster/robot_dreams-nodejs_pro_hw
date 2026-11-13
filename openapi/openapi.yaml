@@ -13,6 +13,99 @@ servers:
     description: Локальний сервер розробки
 security: []
 paths:
+  /auth/login:
+    post:
+      operationId: login
+      summary: Автентифікація користувача та видача пари токенів
+      description: Перевіряє облікові дані та повертає короткоживучий ES256 access-токен і непрозорий refresh-токен.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: Успішний вхід
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPairResponse'
+        '400':
+          description: Невалідний запит
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: Невірний email або пароль
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /auth/refresh:
+    post:
+      operationId: refreshTokens
+      summary: Ротація refresh-токена з детекцією повторного використання
+      description: Видає нову пару токенів, позначає старий refresh-токен використаним та відкликає всю сімʼю при повторному використанні.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: Нова пара токенів видана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPairResponse'
+        '401':
+          description: Refresh-токен невалідний, прострочений або скомпрометований
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Завершення сесії (логаут)
+      description: Додає jti access-токена в денилист Redis і відкликає сімʼю refresh-токенів у PostgreSQL.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '204':
+          description: Сесію завершено
+        '401':
+          description: Неавторизований запит
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
   /instruments:
     get:
       operationId: getInstruments
@@ -50,6 +143,59 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '500':
           description: Внутрішня помилка сервера
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      operationId: createInstrument
+      summary: Створити новий фінансовий інструмент (лише ADMIN або BROKER)
+      description: Додає нову акцію до каталогу. Вимагає роль ADMIN або BROKER.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, company_name, current_price_cents, sector]
+              properties:
+                symbol:
+                  type: string
+                  pattern: '^[A-Z]{1,5}$'
+                company_name:
+                  type: string
+                current_price_cents:
+                  type: integer
+                  minimum: 1
+                sector:
+                  type: string
+                trading_status:
+                  type: string
+                  enum: [ACTIVE, HALTED]
+                logo_url:
+                  type: string
+                  nullable: true
+      responses:
+        '201':
+          description: Інструмент створено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockInstrument'
+        '401':
+          description: Неавторизований запит
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Недостатньо прав (потрібна роль ADMIN або BROKER)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Інструмент уже існує
           content:
             application/problem+json:
               schema:
@@ -180,6 +326,12 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+        '401':
+          description: Неавторизований запит
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '500':
           description: Внутрішня помилка сервера
           content:
@@ -214,6 +366,18 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+        '401':
+          description: Неавторизований запит
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Доступ заборонено (чужий ордер)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '404':
           description: Ордер не знайдено
           content:
@@ -229,6 +393,24 @@ paths:
 
 components:
   schemas:
+    TokenPairResponse:
+      type: object
+      required:
+        - access_token
+        - refresh_token
+        - token_type
+        - expires_in
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+
     StockInstrument:
       type: object
       required:

@@ -5,6 +5,7 @@
   "scripts": {
     "build": "nest build",
     "start": "npm run build && node dist/src/main.js",
+    "start:vault": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/main.js",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/src/main.js",
     "migrate": "bash scripts/with-secrets.sh dev typeorm migration:run -d dist/src/data-source.js",
@@ -26,6 +27,9 @@
     "demo:session": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-session.js",
     "demo:ratelimit": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-ratelimit.js",
     "demo:queue": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-queue.js",
+    "demo:auth": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-auth.js",
+    "demo:reuse": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-reuse.js",
+    "demo:rbac": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-rbac.js",
     "report": "bash scripts/with-secrets.sh dev node dist/src/report.js",
     "backup": "bash scripts/with-secrets.sh dev bash scripts/backup.sh",
     "restore:drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh",

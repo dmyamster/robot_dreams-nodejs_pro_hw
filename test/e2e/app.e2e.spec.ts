@@ -3,6 +3,8 @@ import { INestApplication, HttpStatus } from '@nestjs/common';
 import request from 'supertest';
 import { AppModule } from '../../src/app.module';
 import { configureApp } from '../../src/app.factory';
+import { JwtService } from '../../src/auth/jwt.service';
+import { DenylistService } from '../../src/auth/denylist.service';
 import {
   startPostgresContainer,
   stopPostgresContainer,
@@ -11,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 
 describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
   let app: INestApplication;
+  let authToken: string;
 
   beforeAll(async () => {
     // 1. Start real PostgreSQL testcontainer and supply connection through environment variable
@@ -18,14 +21,30 @@ describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
     process.env.DB_URL = uri;
     process.env.DATABASE_URL = uri;
 
-    // 2. Full Nest application compilation without provider mocks
+    // 2. Full Nest application compilation (DenylistService backed by in-memory Set when Redis is absent in CI)
+    const revokedJtis = new Set<string>();
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
-    }).compile();
+    })
+      .overrideProvider(DenylistService)
+      .useValue({
+        revoke: async (jti: string) => {
+          revokedJtis.add(jti);
+        },
+        isRevoked: async (jti: string) => revokedJtis.has(jti),
+      })
+      .compile();
 
     app = moduleFixture.createNestApplication();
     configureApp(app);
     await app.init();
+
+    const jwtService = app.get(JwtService);
+    authToken = jwtService.signAccessToken({
+      sub: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+      email: 'e2e@broker.test',
+      role: 'ADMIN',
+    }).token;
   });
 
   afterAll(async () => {
@@ -49,6 +68,7 @@ describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
       // 1. CREATE ORDER (POST /api/v1/orders)
       const postResponse = await request(app.getHttpServer())
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${authToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send(orderPayload)
         .expect(HttpStatus.CREATED); // 201
@@ -64,6 +84,7 @@ describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
       // 2. READ ORDER (GET /api/v1/orders/:id)
       const getResponse = await request(app.getHttpServer())
         .get(`/api/v1/orders/${createdId}`)
+        .set('Authorization', `Bearer ${authToken}`)
         .expect(HttpStatus.OK); // 200
 
       expect(getResponse.body).toBeDefined();
@@ -90,12 +111,14 @@ describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
 
       const initialRes = await request(app.getHttpServer())
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${authToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send(orderPayload)
         .expect(HttpStatus.CREATED);
 
       const replayRes = await request(app.getHttpServer())
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${authToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send(orderPayload)
         .expect(HttpStatus.CREATED);
@@ -109,6 +132,7 @@ describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
     it('3. negative: should return 400 Bad Request when Idempotency-Key is missing', async () => {
       const response = await request(app.getHttpServer())
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${authToken}`)
         .send({
           symbol: 'AAPL',
           side: 'BUY',
@@ -125,6 +149,7 @@ describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
     it('4. negative: should return 400 Bad Request when quantity is invalid (quantity = 0)', async () => {
       const response = await request(app.getHttpServer())
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${authToken}`)
         .set('Idempotency-Key', randomUUID())
         .send({
           symbol: 'AAPL',
@@ -141,6 +166,7 @@ describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
     it('5. negative: should return 404 Not Found for non-existent order id', async () => {
       const response = await request(app.getHttpServer())
         .get('/api/v1/orders/00000000-0000-0000-0000-000000000000')
+        .set('Authorization', `Bearer ${authToken}`)
         .expect(HttpStatus.NOT_FOUND); // 404
 
       expect(response.status).toBe(404);
@@ -152,12 +178,14 @@ describe('Paper Trading Broker API (E2E Suite via Supertest)', () => {
 
       await request(app.getHttpServer())
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${authToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({ symbol: 'AAPL', side: 'BUY', type: 'MARKET', quantity: 2 })
         .expect(HttpStatus.CREATED);
 
       const collisionRes = await request(app.getHttpServer())
         .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${authToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({ symbol: 'TSLA', side: 'BUY', type: 'MARKET', quantity: 10 })
         .expect(HttpStatus.UNPROCESSABLE_ENTITY); // 422
