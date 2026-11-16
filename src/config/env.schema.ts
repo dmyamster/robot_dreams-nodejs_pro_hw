@@ -6,6 +6,8 @@ export const envSchema = z.object({
   DB_URL: z.string().min(1, 'DB_URL is required').default(process.env.DATABASE_URL || 'postgres://postgres@127.0.0.1:5432/broker_db'),
   DB_PASSWORD_PATH: z.string().min(1).default('./secrets/db_password'),
   BROKER_URL: z.string().default('amqp://app:app@127.0.0.1:5672'),
+  REDIS_URL: z.string().default('redis://127.0.0.1:6379'),
+  REDIS_QUEUE_URL: z.string().default('redis://127.0.0.1:6380'),
 });
 
 export type Env = z.infer<typeof envSchema>;

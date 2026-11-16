@@ -582,7 +582,7 @@ curl -s "http://127.0.0.1:9292/can-i-deploy?pacticipant=PaperTradingFrontend&ver
 
 ---
 
-## Grading
+## Grading (ДЗ #19 Acceptance Criteria)
 
 ```bash
 # 1. Запуск інфраструктури (Postgres, PgBouncer, Pact Broker, RabbitMQ)
@@ -842,7 +842,7 @@ processed=1
 
 ---
 
-## Grading (ДЗ #22 Acceptance Criteria)
+## Grading (ДЗ #19 Acceptance Criteria) (ДЗ #22 Acceptance Criteria)
 
 ```bash
 docker compose up -d --wait
@@ -1016,6 +1016,102 @@ node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
 # B_RECEIVED=1
 # exit=0
 ```
+
+---
+
+## Redis: кеш, сесії, ліміти, черга
+
+### Чому два інстанси Redis (`redis-cache` і `redis-queue`)
+
+У `docker-compose.yml` піднято два окремі контейнери Redis, оскільки кеш і черга мають взаємовиключні вимоги до памʼяті, а `SELECT 1` не ізолює `maxmemory` та `maxmemory-policy` (вони спільні на весь процес Redis):
+- `redis-cache` (`127.0.0.1:6379`): `--maxmemory 64mb --maxmemory-policy allkeys-lru`. Витісняє старі ключі при заповненні памʼяті; помилки запису (включно з `OOM`) перехоплюються в `CacheAsideService`, щоб кеш ніколи не роняв користувацький запит.
+- `redis-queue` (`127.0.0.1:6380`): `--maxmemory-policy noeviction --appendonly yes --appendfsync everysec`. BullMQ прямо забороняє витіснення ключів (`noeviction`), інакше довільне видалення ключів ламає стан черги й метадані задач.
+
+### Де живуть сесії та чому
+
+Сесії (`SessionService`, rolling TTL через атомарний `GETEX key EX 30`) зберігаються в інстансі **`redis-queue` (`noeviction`)**, а не в `redis-cache`. Якщо покласти сесії в `allkeys-lru`, Redis під тиском памʼяті почне витісняти активні сесії, що призведе до випадкових розлогінень користувачів.
+
+### Модель rate-limit
+
+Обрано **ковзне вікно (Sliding Window Log)** на одному атомарному Lua-скрипті (`ZREMRANGEBYSCORE` + `ZCARD` + `ZADD` + `PEXPIRE`) — він забороняє подвійний сплеск на межі хвилини (2× burst, властивий фіксованому вікну) і гарантує атомарність лічильника між кількома подами. При перевищенні ліміту повертається HTTP `429` та заголовок `Retry-After`.
+
+### Що станеться, якщо stampede-лок зламається, і чому саме тут це прийнятно
+
+Якщо single-flight лок (`SET lock:... <token> NX PX`) протухне під час довгої паузи процесу (GC, page fault) або зламається, два чи більше запитів одночасно не знайдуть значення в кеші й підуть у PostgreSQL. Наслідком буде лише зайвий ідемпотентний `SELECT` (кілька зайвих мілісекунд і копійок на навантаження БД), але бізнес-стан системи залишиться коректним. Саме тому для захисту кеша достатньо звичайного Redis-лока без fencing token, на відміну від критичних бізнес-інваріантів (списання балансу чи залишку), де зламаний лок псує дані й потрібна транзакція або унікальний індекс у БД.
+
+### Власні числа прогонів
+
+- `npm run demo:cache`: `cache-lru=1`, `cache-maxmemory=1`, `warmed=60`, `ttl-distinct=36` (діапазон TTL `300 + random(0..60)` сек), `concurrent=25`, `db-calls=1`, `db-calls-warm=0`
+- `npm run demo:session`: `requests=4`, `sessions=1`, `in-redis=1`, `ttl-renewed=1`
+- `npm run demo:ratelimit`: `instances=2`, `limit=5`, `requests=8`, `allowed=5`, `blocked=3`, `status=429`, `retry-after=1`
+- `npm run demo:queue`: `queue-noeviction=1`, `attempts=3`, `completed=1`, `added=2`, `queued=1`, `schedulers=1`, `scheduled-runs=2`
+
+---
+
+## Grading
+
+```bash
+docker compose up -d --wait
+
+export REDIS_URL=redis://127.0.0.1:6379
+export REDIS_QUEUE_URL=redis://127.0.0.1:6380
+export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:5432/broker_db
+export SKIP_VAULT=1
+
+# 1. Компіляція чиста
+npm ci && npx tsc --noEmit
+npm run migrate
+
+# 2. Кеш економить походи в базу, а лавина дає рівно один
+npm run demo:cache | tee /tmp/c.txt; echo "exit=${PIPESTATUS[0]}"
+for k in db-calls=1 db-calls-warm=0 cache-lru=1 cache-maxmemory=1; do
+  grep -qx "$k" /tmp/c.txt || echo "НЕМАЄ: $k"
+done
+awk -F= '/^concurrent=/{ok=($2>=20)} END{exit !ok}' /tmp/c.txt && echo "concurrent>=20 OK"
+awk -F= '/^warmed=/{ok=($2>=50)}      END{exit !ok}' /tmp/c.txt && echo "warmed>=50 OK"
+awk -F= '/^ttl-distinct=/{ok=($2>=5)} END{exit !ok}' /tmp/c.txt && echo "ttl-distinct>=5 OK"
+
+# 3. Сесія живе в Redis і подовжується при активності
+npm run demo:session | tee /tmp/s.txt; echo "exit=${PIPESTATUS[0]}"
+for k in sessions=1 in-redis=1 ttl-renewed=1; do
+  grep -qx "$k" /tmp/s.txt || echo "НЕМАЄ: $k"
+done
+awk -F= '/^requests=/{ok=($2>=3)} END{exit !ok}' /tmp/s.txt && echo "requests>=3 OK"
+
+# 4. Ліміт спільний для двох подів, 429 і Retry-After на місці
+npm run demo:ratelimit | tee /tmp/r.txt; echo "exit=${PIPESTATUS[0]}"
+for k in status=429 retry-after=1; do
+  grep -qx "$k" /tmp/r.txt || echo "НЕМАЄ: $k"
+done
+awk -F= '/^instances=/{i=$2} /^limit=/{l=$2} /^allowed=/{a=$2} /^blocked=/{b=$2}
+  END{exit !(i>=2 && l>0 && a==l && b>=1)}' /tmp/r.txt && echo "instances/allowed/blocked OK"
+
+# 5. Черга ретраїть, дедуплікує і має планувальник
+npm run demo:queue | tee /tmp/q.txt; echo "exit=${PIPESTATUS[0]}"
+for k in completed=1 added=2 queued=1 queue-noeviction=1; do
+  grep -qx "$k" /tmp/q.txt || echo "НЕМАЄ: $k"
+done
+awk -F= '/^attempts=/{ok=($2>=3)} END{exit !ok}' /tmp/q.txt && echo "attempts>=3 OK"
+awk -F= '/^schedulers=/{ok=($2>=1)} END{exit !ok}' /tmp/q.txt && echo "schedulers>=1 OK"
+awk -F= '/^scheduled-runs=/{ok=($2>=2)} END{exit !ok}' /tmp/q.txt && echo "scheduled-runs>=2 OK"
+
+# 6. Кеш і черга — на різних інстансах Redis
+grep -qx 'cache-lru=1' /tmp/c.txt && grep -qx 'queue-noeviction=1' /tmp/q.txt \
+  && echo "два інстанси OK" || echo "кеш і черга на одному інстансі"
+grep -rniE --exclude-dir=node_modules --exclude-dir=dist "maxmemory[ _-]*policy|noeviction|allkeys[ _-]*lru" .
+
+# 7. Усі чотири демо ходять у Redis через обгортку зі сховищем
+node -e "const s=require('./package.json').scripts;const bad=['demo:cache','demo:session','demo:ratelimit','demo:queue'].filter(k=>/with-secrets\.sh/.test(s[k]||'')===false);console.log(bad.length===0?'OK':'без обгортки: '+bad.join(', '));process.exit(bad.length===0?0:1)"
+
+# 8. Наявність розділу Grading у README
+grep -rlE '^#{1,3} +Grading' --include='README.md' --exclude-dir=node_modules . | wc -l
+
+# 9. Відсутність трекнутих env-файлів з живим рядком підключення
+for f in $(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -vE '\.(example|sample|template|dist)$'); do
+  grep -lE '=(amqps?|postgres(ql)?|redis|https?)://[^ ]*:[^ @]+@' "$f"
+done
+```
+
 
 
 
