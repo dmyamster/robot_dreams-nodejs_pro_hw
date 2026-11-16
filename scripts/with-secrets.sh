@@ -29,5 +29,17 @@ else
       export DB_PASSWORD="super_secret_db_pass_123"
     fi
   fi
+  if [ -z "${JWT_PRIVATE_KEY:-}" ] && [ -f "$ROOT/secrets/jwt_private.b64" ]; then
+    export JWT_PRIVATE_KEY="$(tr -d '\r\n' < "$ROOT/secrets/jwt_private.b64")"
+  fi
+  if [ -z "${JWT_PUBLIC_KEY:-}" ] && [ -f "$ROOT/secrets/jwt_public.b64" ]; then
+    export JWT_PUBLIC_KEY="$(tr -d '\r\n' < "$ROOT/secrets/jwt_public.b64")"
+  fi
+  if [ -z "${REFRESH_TOKEN_PEPPER:-}" ] && [ -f "$ROOT/secrets/refresh_pepper" ]; then
+    export REFRESH_TOKEN_PEPPER="$(tr -d '\r\n' < "$ROOT/secrets/refresh_pepper")"
+  fi
+  if [ -z "${JWT_KID:-}" ]; then
+    export JWT_KID="dev-1"
+  fi
   exec "$@"
 fi

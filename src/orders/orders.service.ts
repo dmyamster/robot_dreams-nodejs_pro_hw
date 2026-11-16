@@ -1,10 +1,13 @@
 import {
+  ForbiddenException,
   Injectable,
   NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { InstrumentsService } from '../instruments/instruments.service';
 import { OrderEventsService } from './order-events.service';
+import { AccessTokenPayload } from '../auth/jwt.service';
 
 export interface Order {
   id: string;
@@ -79,6 +82,7 @@ export class OrdersService {
     string,
     { body: CreateOrderDto; response: Order }
   >();
+  private orderOwners = new Map<string, string>();
 
   constructor(
     private readonly instrumentsService: InstrumentsService,
@@ -111,7 +115,11 @@ export class OrdersService {
     return order;
   }
 
-  create(idempotencyKey: string, dto: CreateOrderDto): { order: Order; isReplay: boolean } {
+  create(
+    idempotencyKey: string,
+    dto: CreateOrderDto,
+    ownerUserId?: string,
+  ): { order: Order; isReplay: boolean } {
     if (this.idempotencyStore.has(idempotencyKey)) {
       const cached = this.idempotencyStore.get(idempotencyKey)!;
       if (JSON.stringify(cached.body) === JSON.stringify(dto)) {
@@ -132,10 +140,11 @@ export class OrdersService {
 
     const feeCents = 150;
     const totalCents = instrumentPrice * dto.quantity + feeCents;
+    const orderId = randomUUID();
 
     const newOrder: Order = {
-      id: 'e4eebc99-9c0b-4ef8-bb6d-6bb9bd380a55',
-      account_id: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+      id: orderId,
+      account_id: ownerUserId ?? 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
       symbol: dto.symbol,
       side: dto.side,
       type: dto.type,
@@ -149,12 +158,15 @@ export class OrdersService {
     };
 
     this.orders.push(newOrder);
+    if (ownerUserId) {
+      this.orderOwners.set(orderId, ownerUserId);
+    }
     this.idempotencyStore.set(idempotencyKey, { body: dto, response: newOrder });
 
     return { order: newOrder, isReplay: false };
   }
 
-  findAll(limit: number = 20, cursor?: string) {
+  findAll(limit: number = 20, cursor?: string, user?: AccessTokenPayload) {
     let startIndex = 0;
     if (cursor) {
       const decoded = parseInt(Buffer.from(cursor, 'base64').toString('utf-8'), 10);
@@ -163,20 +175,30 @@ export class OrdersService {
       }
     }
 
-    const items = this.orders.slice(startIndex, startIndex + limit);
+    const visibleOrders =
+      user && user.role !== 'ADMIN'
+        ? this.orders.filter((o) => (this.orderOwners.get(o.id) ?? o.account_id) === user.sub)
+        : this.orders;
+
+    const items = visibleOrders.slice(startIndex, startIndex + limit);
     const nextIndex = startIndex + limit;
     const next_cursor =
-      nextIndex < this.orders.length
+      nextIndex < visibleOrders.length
         ? Buffer.from(String(nextIndex)).toString('base64')
         : null;
 
     return { items, next_cursor };
   }
 
-  findById(id: string): Order {
+  findById(id: string, user?: AccessTokenPayload): Order {
     const order = this.orders.find((o) => o.id === id);
     if (!order) {
       throw new NotFoundException(`Order with id '${id}' not found`);
+    }
+    // Ownership check lives in the service after loading the resource, not in the auth guard
+    const ownerId = this.orderOwners.get(order.id) ?? order.account_id;
+    if (user && user.role !== 'ADMIN' && ownerId !== user.sub) {
+      throw new ForbiddenException('You do not have permission to access this order');
     }
     return order;
   }
