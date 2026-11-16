@@ -44,7 +44,16 @@
     "test:e2e": "jest --config jest.config.js --runInBand --testMatch '<rootDir>/test/e2e/**/*.spec.ts'",
     "test:contract": "jest --config jest.config.js --runInBand --testMatch '<rootDir>/test/contract/consumer.spec.ts'",
     "verify:provider": "jest --config jest.config.js --runInBand --testMatch '<rootDir>/test/contract/provider.verify.spec.ts'",
-    "test": "npm run lint:spec && npm run check:criteria && node --no-warnings --experimental-strip-types test/run-all-tests.ts"
+    "test": "npm run lint:spec && npm run check:criteria && node --no-warnings --experimental-strip-types test/run-all-tests.ts",
+    "image:build": "DOCKER_BUILDKIT=1 docker build --secret id=npm_token,src=.npm_token -f docker/Dockerfile -t broker-api:hw28 .",
+    "cluster:up": "bash -c 'kind get clusters | grep -qx broker-hw28 || kind create cluster --name broker-hw28 --config k8s/kind-config.yaml' && kind load docker-image broker-api:hw28 --name broker-hw28",
+    "cluster:down": "kind delete cluster --name broker-hw28",
+    "scan": "node scripts/scan-image.mjs",
+    "up": "mkdir -p .pulumi && bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select dev --create && pulumi --cwd infra up --yes --non-interactive'",
+    "destroy": "bash scripts/with-secrets.sh dev pulumi --cwd infra destroy --yes --non-interactive",
+    "demo:image": "bash demo/demo-image.sh",
+    "demo:rollout": "bash demo/demo-rollout.sh",
+    "demo:pdb": "bash demo/demo-pdb.sh"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1168.0",
