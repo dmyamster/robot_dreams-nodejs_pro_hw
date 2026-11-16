@@ -9,3 +9,4 @@ export * from './order-notification.entity';
 export * from './outbox.entity';
 export * from './processed-message.entity';
 export * from './refresh-token.entity';
+export * from './file-object.entity';

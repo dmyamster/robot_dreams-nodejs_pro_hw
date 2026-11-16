@@ -17,6 +17,12 @@ function ensureTestAuthEnv(): void {
   if (!process.env.JWT_KID) {
     process.env.JWT_KID = 'test-1';
   }
+  if (!process.env.STORAGE_ACCESS_KEY) {
+    process.env.STORAGE_ACCESS_KEY = 'test-access-key';
+  }
+  if (!process.env.STORAGE_SECRET_KEY) {
+    process.env.STORAGE_SECRET_KEY = 'test-secret-key';
+  }
 }
 
 async function main(): Promise<void> {
