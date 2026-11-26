@@ -158,7 +158,7 @@ jobs:
       - name: Generate Pulumi preview plan
         env:
           PULUMI_BACKEND_URL: file://${{ github.workspace }}/.pulumi
-          PULUMI_CONFIG_PASSPHRASE: ci-preview-passphrase
+          PULUMI_CONFIG_PASSPHRASE: ''
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
         run: |
           mkdir -p .pulumi secrets
@@ -179,7 +179,7 @@ jobs:
               fs.writeFileSync("secrets/storage_secret_key", randomBytes(16).toString("hex"));
             '
           fi
-          bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select dev --create && pulumi --cwd infra preview --json --non-interactive > plan.json'
+          bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select ci --create && pulumi --cwd infra preview --json --non-interactive > plan.json'
 
       - name: Run Cost Gate
         env:
@@ -264,7 +264,7 @@ jobs:
         id: deploy
         env:
           PULUMI_BACKEND_URL: file://${{ github.workspace }}/.pulumi
-          PULUMI_CONFIG_PASSPHRASE: ci-deploy-passphrase
+          PULUMI_CONFIG_PASSPHRASE: ''
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
           IMAGE_REF: ${{ needs.build.outputs.image-ref }}
           BUILT_DIGEST: ${{ needs.build.outputs.digest }}
@@ -290,7 +290,7 @@ jobs:
           IMAGE_REPO="${IMAGE_REF%:*}"
           export APP_IMAGE="${IMAGE_REPO}@${BUILT_DIGEST}"
           export REV="${BUILT_DIGEST}"
-          bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select dev --create && pulumi --cwd infra up --yes --non-interactive'
+          bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select ci --create && pulumi --cwd infra up --yes --non-interactive'
           MIN_REQUESTS=2000 bash demo/demo-rollout.sh | tee rollout.txt
 
       - name: Collect pipeline evidence
