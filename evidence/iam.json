@@ -66,13 +66,17 @@
       {
         "Action": [
           "elasticloadbalancing:DescribeLoadBalancers",
+          "elasticloadbalancing:DescribeLoadBalancerAttributes",
           "elasticloadbalancing:DeleteLoadBalancer",
           "elasticloadbalancing:DescribeTargetGroups",
+          "elasticloadbalancing:DescribeTargetGroupAttributes",
           "elasticloadbalancing:DeleteTargetGroup",
           "elasticloadbalancing:DescribeListeners",
+          "elasticloadbalancing:DescribeListenerAttributes",
           "elasticloadbalancing:DeleteListener",
           "elasticloadbalancing:DescribeTags",
-          "elasticloadbalancing:DescribeTargetHealth"
+          "elasticloadbalancing:DescribeTargetHealth",
+          "elasticloadbalancing:DeregisterTargets"
         ],
         "Effect": "Allow",
         "Resource": "*",
@@ -91,6 +95,7 @@
           "ec2:DescribeInternetGateways",
           "ec2:DescribeNetworkInterfaces",
           "ec2:DeleteNetworkInterface",
+          "ec2:DescribeAvailabilityZones",
           "ec2:DescribeTags"
         ],
         "Effect": "Allow",
@@ -100,10 +105,12 @@
       {
         "Action": [
           "lambda:GetFunction",
+          "lambda:GetFunctionConfiguration",
           "lambda:DeleteFunction",
           "lambda:GetPolicy",
           "lambda:RemovePermission",
-          "lambda:ListVersionsByFunction"
+          "lambda:ListVersionsByFunction",
+          "lambda:ListTags"
         ],
         "Effect": "Allow",
         "Resource": "*",
@@ -117,7 +124,8 @@
           "iam:DeleteRolePolicy",
           "iam:DetachRolePolicy",
           "iam:ListRolePolicies",
-          "iam:ListAttachedRolePolicies"
+          "iam:ListAttachedRolePolicies",
+          "iam:ListInstanceProfilesForRole"
         ],
         "Effect": "Allow",
         "Resource": "arn:aws:iam::*:role/hw31-*",
