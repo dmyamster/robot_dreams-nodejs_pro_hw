@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
 
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -62,8 +64,14 @@ jobs:
           IMAGE_REPO="ghcr.io/${REPO_LOWER}/broker-api"
           if [ -n "$INPUT_DIGEST" ]; then
             DIGEST="$INPUT_DIGEST"
+          elif DIGEST=$(docker buildx imagetools inspect "${IMAGE_REPO}:${{ github.sha }}" --format '{{.Manifest.Digest}}' 2>/dev/null); then
+            echo "Resolved image by commit SHA ${{ github.sha }}"
+          elif PR_HEAD_SHA=$(git rev-parse "${{ github.sha }}^2" 2>/dev/null) && [ -n "$PR_HEAD_SHA" ]; then
+            echo "Resolved merge commit; inspecting PR head SHA ${PR_HEAD_SHA}"
+            DIGEST=$(docker buildx imagetools inspect "${IMAGE_REPO}:${PR_HEAD_SHA}" --format '{{.Manifest.Digest}}')
           else
-            DIGEST=$(docker buildx imagetools inspect "${IMAGE_REPO}:${{ github.sha }}" --format '{{.Manifest.Digest}}')
+            echo "Could not resolve image digest for ${{ github.sha }}" >&2
+            exit 1
           fi
           echo "image_by_digest=${IMAGE_REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
