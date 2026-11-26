@@ -179,7 +179,7 @@ jobs:
               fs.writeFileSync("secrets/storage_secret_key", randomBytes(16).toString("hex"));
             '
           fi
-          bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select ci --create && pulumi --cwd infra preview --json --non-interactive > plan.json'
+          bash scripts/with-secrets.sh dev bash -c 'cd infra && pulumi stack select ci --create && pulumi preview --json --non-interactive > ../plan.json'
 
       - name: Run Cost Gate
         env:
