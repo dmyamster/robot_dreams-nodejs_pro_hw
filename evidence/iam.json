@@ -19,7 +19,7 @@
               "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
             },
             "StringLike": {
-              "token.actions.githubusercontent.com:sub": "repo:dmyamster/robot_dreams-nodejs_pro_hw:*"
+              "token.actions.githubusercontent.com:sub": "repo:dmyamster*/robot_dreams-nodejs_pro_hw*:*"
             }
           }
         }

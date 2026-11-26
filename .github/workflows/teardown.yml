@@ -28,32 +28,10 @@ jobs:
           node-version: '22'
 
       - name: Configure AWS credentials via OIDC
-        id: aws-oidc
-        continue-on-error: true
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Fallback / Diagnose regional STS OIDC if needed
-        if: steps.aws-oidc.outcome == 'failure'
-        run: |
-          OIDC_JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value')
-          CREDS=$(aws sts assume-role-with-web-identity \
-            --region "$AWS_REGION" \
-            --endpoint-url "https://sts.${AWS_REGION}.amazonaws.com" \
-            --role-arn "${{ vars.AWS_ROLE_ARN }}" \
-            --role-session-name "hw31-teardown" \
-            --web-identity-token "$OIDC_JWT" \
-            --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-            --output text)
-          read -r AK SK ST <<< "$CREDS"
-          echo "::add-mask::$AK"
-          echo "::add-mask::$SK"
-          echo "::add-mask::$ST"
-          echo "AWS_ACCESS_KEY_ID=$AK" >> "$GITHUB_ENV"
-          echo "AWS_SECRET_ACCESS_KEY=$SK" >> "$GITHUB_ENV"
-          echo "AWS_SESSION_TOKEN=$ST" >> "$GITHUB_ENV"
 
       - name: Setup Pulumi CLI
         uses: pulumi/actions@v5
