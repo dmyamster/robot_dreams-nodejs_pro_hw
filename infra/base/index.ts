@@ -176,7 +176,7 @@ const assumeRolePolicy = githubOidcProvider.arn.apply((providerArn) =>
             "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
           },
           StringLike: {
-            "token.actions.githubusercontent.com:sub": `repo:${githubRepo}:*`,
+            "token.actions.githubusercontent.com:sub": `repo:${githubRepo.split("/")[0]}*/${githubRepo.split("/")[1]}*:*`,
           },
         },
       },
