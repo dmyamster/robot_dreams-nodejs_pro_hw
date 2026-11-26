@@ -47,5 +47,20 @@ else
   if [ -z "${STORAGE_SECRET_KEY:-}" ] && [ -f "$ROOT/secrets/storage_secret_key" ]; then
     export STORAGE_SECRET_KEY="$(tr -d '\r\n' < "$ROOT/secrets/storage_secret_key")"
   fi
+  if [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
+    export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:22918"
+  fi
+  if [ -z "${PROMETHEUS_URL:-}" ]; then
+    export PROMETHEUS_URL="http://127.0.0.1:22901"
+  fi
+  if [ -z "${TRACE_API_URL:-}" ]; then
+    export TRACE_API_URL="http://127.0.0.1:22904"
+  fi
+  if [ -z "${GRAFANA_USER:-}" ]; then
+    export GRAFANA_USER="admin"
+  fi
+  if [ -z "${GRAFANA_PASSWORD:-}" ]; then
+    export GRAFANA_PASSWORD="admin"
+  fi
   exec "$@"
 fi

@@ -17,23 +17,27 @@ import { Response, Request } from 'express';
 import { OrdersService, CreateOrderDto } from './orders.service';
 import { OrderEventsService, OrderStatusEvent } from './order-events.service';
 import { AuthenticatedRequest, JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { createLayerLogger } from '../observability/logger';
 
 @Controller('orders')
 @UseGuards(JwtAuthGuard)
 export class OrdersController {
+  private readonly logger = createLayerLogger('orders.controller');
+
   constructor(
     private readonly ordersService: OrdersService,
     private readonly orderEventsService: OrderEventsService,
   ) {}
 
   @Post()
-  createOrder(
+  async createOrder(
     @Headers('idempotency-key') idempotencyKey: string,
     @Body() createOrderDto: CreateOrderDto,
     @Req() req: AuthenticatedRequest,
     @Res() res: Response,
   ) {
-    const result = this.ordersService.create(
+    this.logger.info({ symbol: createOrderDto.symbol }, 'controller createOrder');
+    const result = await this.ordersService.create(
       idempotencyKey,
       createOrderDto,
       req.user.sub,
@@ -105,8 +109,15 @@ export class OrdersController {
   getOrderById(
     @Param('id') id: string,
     @Req() req: AuthenticatedRequest,
+    @Headers('x-demo-delay-ms') demoDelayMs?: string,
   ) {
-    return this.ordersService.findById(id, req.user);
+    this.logger.info({ orderId: id }, 'controller getOrderById');
+    const parsedDelay = demoDelayMs ? parseInt(demoDelayMs, 10) : 0;
+    const boundedDelay =
+      Number.isFinite(parsedDelay) && parsedDelay > 0
+        ? Math.min(parsedDelay, 5000)
+        : 0;
+    return this.ordersService.findById(id, req.user, boundedDelay);
   }
 
   @Patch(':id/status')

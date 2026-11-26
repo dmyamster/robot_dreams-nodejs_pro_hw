@@ -1400,6 +1400,98 @@ console.log("посилань на Secret =", refs); process.exit(refs>=1?0:1)'
 npm run destroy && npm run cluster:down
 ```
 
+## Observability
+
+Локальний стек спостережуваності підіймається з [`observability/docker-compose.yml`](observability/docker-compose.yml):
+- **Prometheus** (`:22901` → `9090`) — скрейпить `GET /metrics` кожні `5s`.
+- **Jaeger** (`:22917` OTLP gRPC, `:22918` OTLP HTTP, `:22904` Query/UI) — приймає спани OpenTelemetry та надає HTTP API `/api/traces/<traceId>`.
+- **Grafana** (`:22930` → `3000`) — автоматично провіженить datasource `Prometheus` та дашборд [`observability/grafana/dashboards/broker-red.json`](observability/grafana/dashboards/broker-red.json).
+
+Заміри памʼяті (`docker stats --no-stream`):
+- Базовий стек (`postgres`, `pgbouncer`, `rabbitmq`, `redis-cache`, `redis-queue`, `minio`, `pact-broker`): ~`719 MiB`.
+- Після додавання стеку спостережуваності (`broker_grafana` ~`69.7 MiB`, `broker_prometheus` ~`22.9 MiB`, `broker_jaeger` ~`13.3 MiB`): разом ~`742 MiB` з `7.748 GiB` ліміту.
+
+### Змінні оточення
+
+| Змінна | Призначення | Джерело |
+| --- | --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Базовий URL OTLP/HTTP колектора трейсів (`http://127.0.0.1:22918`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `OTEL_SERVICE_NAME` | Імʼя сервісу в спанах та логах (`paper-trading-broker-api`) | `env.schema.ts` / середовище |
+| `PROMETHEUS_URL` | URL Prometheus для перевірки готовності та запитів (`http://127.0.0.1:22901`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `TRACE_API_URL` | URL API бекенда трейсів Jaeger (`http://127.0.0.1:22904`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `GRAFANA_USER` | Логін адміністратора Grafana (`admin`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `GRAFANA_PASSWORD` | Пароль адміністратора Grafana (`admin`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `LOG_LEVEL` | Рівень логування `pino` (`info`) | `env.schema.ts` / середовище |
+
+### Панелі RED у Grafana
+
+1. **Rate — HTTP Requests per Second** (скільки запитів на секунду обробляє кожен маршрут):
+   ```promql
+   sum(rate(http_requests_total[1m])) by (route, method)
+   ```
+2. **Errors — 5xx Error Ratio** (яка частка запитів завершується серверною помилкою 5xx):
+   ```promql
+   sum(rate(http_requests_total{status=~"5.."}[1m])) / clamp_min(sum(rate(http_requests_total[1m])), 1e-9)
+   ```
+3. **Duration — Request Latency Quantiles (p50 / p95 / p99)** (скільки часу триває обробка запиту за квантилями):
+   ```promql
+   histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[1m])) by (le, route))
+   ```
+
+### Межі бакетів гістограми
+
+Для `http_request_duration_seconds` задано бакети:
+`[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15]` (секунди).
+Верхній скінченний бакет `le="15"` перевищує найгірший випадок (контрольована затримка до `5s` у контролері та `1.1s` у `demo:metrics`), тому `histogram_quantile` не впирається у верхню межу і `above-top-bucket=0`. Лейбл `route` нормалізується до шаблону маршруту Express (наприклад, `/api/v1/orders/:id`), що гарантує обмежену кардинальність часових рядів.
+
+### Результати прогонів демо (3 прогони)
+
+- `npm run demo:logs`:
+  `non-json-lines=0`, `layers=3`, `distinct-trace-ids=1`, `trace-id-matches-header=1`, `burst=8`, `burst-trace-ids=8`, `burst-uneven=0`, `secret-req-logged=1`, `secret-in-logs=0`
+- `npm run demo:metrics`:
+  `sent-ok=145`, `sent-fail=10`, `counter-delta=155`, `errors-delta=10`, `above-top-bucket=0`, `series-before=3`, `series-after=3`
+- `npm run demo:trace`:
+  `spans=16`, `orphan-spans=0`, `trace-matches-header=1`, `trace-matches-log=1`, `span-status-error=1`
+
+## Grading
+
+```bash
+docker compose up -d --wait
+docker compose -f observability/docker-compose.yml up -d --wait
+
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:22918
+export PROMETHEUS_URL=http://127.0.0.1:22901
+export TRACE_API_URL=http://127.0.0.1:22904
+export GRAFANA_USER=admin
+export GRAFANA_PASSWORD=admin
+export REDIS_URL=redis://127.0.0.1:6379
+export REDIS_QUEUE_URL=redis://127.0.0.1:6380
+export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:5432/broker_db
+export STORAGE_ENDPOINT=http://127.0.0.1:22650
+export STORAGE_REGION=us-east-1
+export STORAGE_BUCKET=hw26-files
+export STORAGE_ACCESS_KEY=hw26user
+export STORAGE_SECRET_KEY=hw26secretpass
+export REFRESH_TOKEN_PEPPER=grader-pepper-at-least-32-bytes-long
+export SKIP_VAULT=1
+
+node -e 'const {generateKeyPairSync}=require("node:crypto"),fs=require("node:fs");
+const k=generateKeyPairSync("ec",{namedCurve:"P-256",
+  privateKeyEncoding:{type:"pkcs8",format:"pem"},
+  publicKeyEncoding:{type:"spki",format:"pem"}});
+fs.writeFileSync("/tmp/priv.b64",Buffer.from(k.privateKey).toString("base64"));
+fs.writeFileSync("/tmp/pub.b64",Buffer.from(k.publicKey).toString("base64"));'
+export JWT_KID=grader
+export JWT_PRIVATE_KEY="$(cat /tmp/priv.b64)"
+export JWT_PUBLIC_KEY="$(cat /tmp/pub.b64)"
+
+npm ci
+npx tsc --noEmit
+npm run demo:logs
+npm run demo:metrics
+npm run demo:trace
+```
+
 
 
 
