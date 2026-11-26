@@ -53,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          STATE_LEFT=$(pulumi stack export | jq '[.deployment.resources[] | select(.type | startswith("aws:"))] | length')
+          STATE_LEFT=$(pulumi stack export | jq '[(.deployment.resources // [])[] | select(.type | startswith("aws:"))] | length')
 
           TAGGED_LEFT=0
           RDS_LEFT=0
