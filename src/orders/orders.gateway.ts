@@ -70,7 +70,7 @@ export class OrdersGateway implements OnGatewayInit {
     // Validate ownership
     let order: any;
     try {
-      order = this.ordersService.findById(orderId);
+      order = await this.ordersService.findById(orderId);
     } catch {
       return { success: false, error: 'Order not found' };
     }

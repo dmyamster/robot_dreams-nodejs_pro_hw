@@ -7,6 +7,7 @@ import { HealthModule } from './health/health.module';
 import { InstrumentsModule } from './instruments/instruments.module';
 import { OrdersModule } from './orders/orders.module';
 import { FilesModule } from './files/files.module';
+import { ObservabilityModule } from './observability/observability.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { FilesModule } from './files/files.module';
       envFilePath: ['.env'],
     }),
     DatabaseModule,
+    ObservabilityModule,
     AuthModule,
     HealthModule,
     InstrumentsModule,

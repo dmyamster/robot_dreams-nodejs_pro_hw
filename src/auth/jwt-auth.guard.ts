@@ -7,6 +7,7 @@ import {
 import { Request } from 'express';
 import { AccessTokenPayload, JwtService } from './jwt.service';
 import { DenylistService } from './denylist.service';
+import { setRequestContextUser } from '../observability/request-context';
 
 export interface AuthenticatedRequest extends Request {
   user: AccessTokenPayload;
@@ -42,6 +43,7 @@ export class JwtAuthGuard implements CanActivate {
     }
 
     (req as AuthenticatedRequest).user = payload;
+    setRequestContextUser(payload.sub);
     return true;
   }
 }
