@@ -62,9 +62,18 @@ jobs:
           EIP_LEFT=0
 
           for R in "$AWS_REGION" us-east-1; do
-            t=$(aws resourcegroupstaggingapi get-resources --region "$R" \
+            t=0
+            for arn in $(aws resourcegroupstaggingapi get-resources --region "$R" \
               --tag-filters Key=Project,Values=nodejs-pro-hw31 Key=Stack,Values=demo \
-              --query 'length(ResourceTagMappingList)' --output text 2>/dev/null || echo 0)
+              --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null || true); do
+              if [[ "$arn" == *:natgateway/* ]]; then
+                ngw_id="${arn##*/}"
+                ngw_state=$(aws ec2 describe-nat-gateways --region "$R" --nat-gateway-ids "$ngw_id" \
+                  --query 'NatGateways[0].State' --output text 2>/dev/null || echo "deleted")
+                [ "$ngw_state" = "deleted" ] && continue
+              fi
+              t=$((t + 1))
+            done
             r=$(aws rds describe-db-instances --region "$R" --query 'length(DBInstances)' --output text 2>/dev/null || echo 0)
             a=$(aws elbv2 describe-load-balancers --region "$R" --query 'length(LoadBalancers)' --output text 2>/dev/null || echo 0)
             n=$(aws ec2 describe-nat-gateways --region "$R" --filter Name=state,Values=available --query 'length(NatGateways)' --output text 2>/dev/null || echo 0)
