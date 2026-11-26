@@ -1,0 +1,3 @@
+name: hw31-base
+runtime: nodejs
+description: Base AWS infrastructure for HW #31 (Budget, VPC, Subnets, SG, IAM OIDC)
