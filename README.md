@@ -1495,7 +1495,7 @@ npm run demo:trace
 ## AWS
 
 смуга: основна
-teardown-run: PENDING_WORKFLOW_DISPATCH_RUN_URL
+teardown-run: https://github.com/dmyamster/robot_dreams-nodejs_pro_hw/actions/runs/45858455775
 регіон: `eu-north-1` (Стокгольм; дозволений регіон Free Plan акаунта)
 
 Pulumi-програми знаходяться в [`infra/base`](infra/base) та [`infra/demo`](infra/demo), скрипти керування — у кореневому [`package.json`](package.json) (`up:base`, `up:demo`, `destroy:demo`, `destroy:base`, `demo:failover`, `demo:nat`, `demo:alb`).
