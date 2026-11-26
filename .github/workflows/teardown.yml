@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AWS_REGION: eu-north-1
+      AWS_STS_REGIONAL_ENDPOINTS: regional
       PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
       PULUMI_BACKEND_URL: ${{ vars.PULUMI_BACKEND_URL }}
       PULUMI_CONFIG_PASSPHRASE: ${{ vars.PULUMI_CONFIG_PASSPHRASE || 'hw31-teardown' }}
