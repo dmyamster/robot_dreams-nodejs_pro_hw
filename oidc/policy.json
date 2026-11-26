@@ -1,0 +1,13 @@
+{
+  "iss": "https://token.actions.githubusercontent.com",
+  "aud": "broker-ci-deploy",
+  "allowed_subs": [
+    "repo:dmyamster/robot_dreams-nodejs_pro_hw:pull_request",
+    "repo:dmyamster/robot_dreams-nodejs_pro_hw:ref:refs/heads/main",
+    "repo:dmyamster/robot_dreams-nodejs_pro_hw:environment:staging",
+    "repo:dmyamster/robot_dreams-nodejs_pro_hw:environment:production"
+  ],
+  "allowed_sub_patterns": [
+    "^repo:dmyamster(@[0-9]+)?/robot_dreams-nodejs_pro_hw(@[0-9]+)?:(pull_request|ref:refs/heads/main|environment:(staging|production))$"
+  ]
+}

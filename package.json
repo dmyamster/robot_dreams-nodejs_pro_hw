@@ -64,7 +64,10 @@
     "evidence:base": "bash scripts/with-secrets.sh dev bash demo/collect-base-evidence.sh",
     "demo:failover": "bash scripts/with-secrets.sh dev bash demo/demo-failover.sh",
     "demo:nat": "bash scripts/with-secrets.sh dev bash demo/demo-nat.sh",
-    "demo:alb": "bash scripts/with-secrets.sh dev bash demo/demo-alb.sh"
+    "demo:alb": "bash scripts/with-secrets.sh dev bash demo/demo-alb.sh",
+    "demo:gates": "node scripts/demo-gates.mjs",
+    "demo:oidc": "node scripts/demo-oidc.mjs",
+    "gate:cost": "node --no-warnings --experimental-strip-types scripts/gate-cost.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1168.0",
@@ -97,6 +100,7 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@nestjs/cli": "^11.0.0",
     "@nestjs/testing": "^11.2.6",
     "@pact-foundation/pact": "^17.1.4",
@@ -107,10 +111,13 @@
     "@types/node": "^22.10.5",
     "@types/pg": "^8.23.1",
     "@types/supertest": "^7.2.1",
+    "dependency-cruiser": "^18.9.0",
+    "eslint": "^10.15.0",
     "jest": "^30.5.2",
     "supertest": "^7.3.0",
     "testcontainers": "^12.2.0",
     "ts-jest": "^29.4.14",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.74.0"
   }
 }

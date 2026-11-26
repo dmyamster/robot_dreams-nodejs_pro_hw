@@ -1453,7 +1453,71 @@ npm run destroy && npm run cluster:down
 - `npm run demo:trace`:
   `spans=16`, `orphan-spans=0`, `trace-matches-header=1`, `trace-matches-log=1`, `span-status-error=1`
 
+## CI/CD
+
+Конвеєр як код складається з трьох воркфлоу у `.github/workflows/`:
+- [`ci.yml`](.github/workflows/ci.yml) (`pull_request`, `workflow_dispatch`):
+  1. **`gates`**: 4 сходинки якості — `tsc --noEmit` + `eslint`, контракт OpenAPI (`oasdiff breaking`), архітектурні межі (`dependency-cruiser`).
+  2. **`build`** (`needs: gates`): єдине місце збірки образу (`docker/build-push-action`), публікація в GHCR, запис `build.log` (1 рядок), сканування Trivy (`npm run scan`, поріг `SCAN_MAX=100`). Віддає `digest` у `outputs`.
+  3. **`cost-gate`** (`needs: gates`): `pulumi preview --json > plan.json` + гейт вартості (`npm run gate:cost`, `src/mapping.ts`).
+  4. **`oidc-rollout`** (`needs: [build, cost-gate]`): запит OIDC-токена (`permissions: id-token: write` лише на рівні джоби), криптографічна перевірка підпису й політики [`oidc/policy.json`](oidc/policy.json) через [`scripts/oidc-gate.mjs`](scripts/oidc-gate.mjs), підняття `kind`-кластера `broker-hw28`, завантаження образу за `@digest` (`needs.build.outputs.digest`), деплой через `pulumi up`, прогін `MIN_REQUESTS=2000 bash demo/demo-rollout.sh` (`failed=0`) та вивантаження артефакту `pipeline-evidence` (`if: always()`).
+- [`deploy.yml`](.github/workflows/deploy.yml) (`push` у `main`, `workflow_dispatch`): промоушн вже зібраного образу за `@digest` у середовище `production` після перевірки OIDC-токена (без повторної збірки).
+- [`teardown.yml`](.github/workflows/teardown.yml) (`schedule`, `workflow_dispatch`): автоматичне прибирання AWS-стеку з ДЗ #31.
+
+### Секрети конвеєра (`${{ secrets.* }}`)
+
+Довгоживучих хмарних ключів (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` тощо) у секретах репозиторію чи середовищ немає (`0`).
+
+| Секрет | Призначення |
+|---|---|
+| `GITHUB_TOKEN` | Автоматичний токен GitHub Actions (`packages: write` для публікації образу в GHCR, `packages: read` для pull за digest) |
+| `VAULT_TOKEN` | Доступ до сховища секретів застосунку з ДЗ #11 (`scripts/with-secrets.sh`); не відкриває хмару або реєстр |
+| `PULUMI_ACCESS_TOKEN` | Токен Pulumi Cloud для автоматичного teardown AWS-інфраструктури у `teardown.yml` (ДЗ #31) |
+
+### Змінні застосунку зі сховища
+
+| Змінна | Джерело | Куди потрапляє |
+|---|---|---|
+| `DB_PASSWORD` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `JWT_PRIVATE_KEY` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `JWT_PUBLIC_KEY` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `REFRESH_TOKEN_PEPPER` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `STORAGE_ACCESS_KEY` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `STORAGE_SECRET_KEY` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+
+### Межа маскування секретів
+
+Маскування логів у GitHub Actions замінює лише точне входження значення у stdout/stderr; воно не спрацьовує, якщо значення перекодоване (base64, hex), розрізане або надруковане серіалізатором. Тому в конвеєрі відсутні `env`, `printenv`, `set -x` та `echo "$SECRET"` у кроках із доступом до секретів, а секрети застосунку передаються у под лише посиланням (`secretRef`) у момент запуску, а не під час `docker build`.
+
+### Ставки та обхід гейта вартості (`src/mapping.ts`)
+
+Джерело ставок: [AWS Fargate Pricing (`eu-central-1`, 730 год/міс)](https://aws.amazon.com/fargate/pricing/):
+- vCPU: `$0.04656 / vCPU-год` (`$33.9888 / vCPU-міс`)
+- Memory: `$0.00511 / GiB-год` (`$3.7303 / GiB-міс`)
+- Для `broker-api` (`replicas=2`, `50m` CPU, `128Mi` RAM): `plan-usd = $4.33/міс` (бюджет PR-гейта за замовчуванням: `$10/міс`).
+
+cost-gate-bypass-label: cost-approved
+
 ## Grading
+
+```bash
+git clone https://github.com/dmyamster/robot_dreams-nodejs_pro_hw.git && cd robot_dreams-nodejs_pro_hw && git checkout hw-32
+npm ci
+export SKIP_VAULT=1
+export DB_PASSWORD=grader-secret
+export REFRESH_TOKEN_PEPPER=grader-pepper-at-least-32-bytes-long
+export STORAGE_ACCESS_KEY=grader-access
+export STORAGE_SECRET_KEY=grader-secret-key
+
+npm run demo:gates
+npm run demo:oidc
+
+PLAN_JSON=/tmp/hw32/plan.json COST_BUDGET_USD=0 npm run gate:cost
+PLAN_JSON=/tmp/hw32/plan.json COST_BUDGET_USD=999999 npm run gate:cost
+```
+
+<details>
+<summary>Попередні налаштування Grading (Observability / #28)</summary>
 
 ```bash
 docker compose up -d --wait
@@ -1491,6 +1555,8 @@ npm run demo:logs
 npm run demo:metrics
 npm run demo:trace
 ```
+
+</details>
 
 ## AWS
 
