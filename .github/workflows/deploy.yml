@@ -1,0 +1,114 @@
+name: Deploy to Production (Promote by Digest)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: 'Image digest to promote (sha256:...)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: OIDC Verify & Promote Digest
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm ci --prefix infra
+
+      - name: Verify GitHub OIDC token via oidc-gate
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=broker-ci-deploy" | jq -r '.value')
+          OIDC_TOKEN="$TOKEN" node scripts/oidc-gate.mjs \
+            --policy oidc/policy.json \
+            --iss https://token.actions.githubusercontent.com \
+            --aud broker-ci-deploy
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve digest (promote without rebuild)
+        id: resolve
+        env:
+          INPUT_DIGEST: ${{ inputs.digest }}
+        run: |
+          REPO_LOWER="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE_REPO="ghcr.io/${REPO_LOWER}/broker-api"
+          if [ -n "$INPUT_DIGEST" ]; then
+            DIGEST="$INPUT_DIGEST"
+          else
+            DIGEST=$(docker buildx imagetools inspect "${IMAGE_REPO}:${{ github.sha }}" --format '{{.Manifest.Digest}}')
+          fi
+          echo "image_by_digest=${IMAGE_REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          cluster_name: broker-hw28
+          config: k8s/kind-config.yaml
+
+      - name: Pull image by digest and load into Kind
+        run: |
+          docker pull "${{ steps.resolve.outputs.image_by_digest }}"
+          kind load docker-image "${{ steps.resolve.outputs.image_by_digest }}" --name broker-hw28
+
+      - name: Set up Pulumi CLI
+        uses: pulumi/actions@0ce33695f880624d4f27bd6db25e680c7df4d551 # v7.2.0
+        with:
+          pulumi-version: '^3.150.0'
+
+      - name: Deploy with Pulumi
+        env:
+          PULUMI_BACKEND_URL: file://${{ github.workspace }}/.pulumi
+          PULUMI_CONFIG_PASSPHRASE: ci-prod-passphrase
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          APP_IMAGE: ${{ steps.resolve.outputs.image_by_digest }}
+          REV: ${{ steps.resolve.outputs.digest }}
+        run: |
+          mkdir -p .pulumi secrets
+          if [ -z "${VAULT_TOKEN:-}" ]; then
+            node -e '
+              const { generateKeyPairSync, randomBytes } = require("node:crypto");
+              const fs = require("node:fs");
+              const k = generateKeyPairSync("ec", {
+                namedCurve: "P-256",
+                privateKeyEncoding: { type: "pkcs8", format: "pem" },
+                publicKeyEncoding: { type: "spki", format: "pem" },
+              });
+              fs.writeFileSync("secrets/db_password", randomBytes(16).toString("hex"));
+              fs.writeFileSync("secrets/jwt_private.b64", Buffer.from(k.privateKey).toString("base64"));
+              fs.writeFileSync("secrets/jwt_public.b64", Buffer.from(k.publicKey).toString("base64"));
+              fs.writeFileSync("secrets/refresh_pepper", randomBytes(32).toString("hex"));
+              fs.writeFileSync("secrets/storage_access_key", "ci-storage-key");
+              fs.writeFileSync("secrets/storage_secret_key", randomBytes(16).toString("hex"));
+            '
+          fi
+          bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select dev --create && pulumi --cwd infra up --yes --non-interactive'
+          kubectl -n broker-hw28 rollout status deployment/broker-api --timeout=180s

@@ -4,6 +4,7 @@ set -euo pipefail
 NS="${K8S_NAMESPACE:-broker-hw28}"
 PROFILE="${DEPLOY_PROFILE:-hardened}"
 TARGET_URL="${TARGET_URL:-http://127.0.0.1:30080/healthz}"
+MIN_REQUESTS="${MIN_REQUESTS:-5000}"
 
 CODES_FILE=$(mktemp /tmp/rollout-codes-XXXXXX.txt)
 LOAD_PID=""
@@ -37,8 +38,9 @@ kubectl -n "$NS" rollout status deployment/broker-api --timeout=180s >/dev/null
 END_TS=$(date +%s)
 ROLLOUT_SECONDS=$((END_TS - START_TS))
 
-# Keep load running briefly after rollout completes to ensure >= 5000 requests
-while [ "$(wc -l < "$CODES_FILE" | tr -d ' ')" -lt 5500 ]; do
+# Keep load running briefly after rollout completes to ensure >= MIN_REQUESTS requests
+TARGET_WAIT=$((MIN_REQUESTS + 200))
+while [ "$(wc -l < "$CODES_FILE" | tr -d ' ')" -lt "$TARGET_WAIT" ]; do
   sleep 1
 done
 
@@ -58,6 +60,6 @@ echo "ok=$OK"
 echo "failed=$FAILED"
 echo "rollout-seconds=$ROLLOUT_SECONDS"
 
-if [ "$FAILED" -ne 0 ] || [ "$REQUESTS" -lt 5000 ]; then
+if [ "$FAILED" -ne 0 ] || [ "$REQUESTS" -lt "$MIN_REQUESTS" ]; then
   exit 1
 fi
