@@ -87,7 +87,7 @@ jobs:
       - name: Deploy with Pulumi
         env:
           PULUMI_BACKEND_URL: file://${{ github.workspace }}/.pulumi
-          PULUMI_CONFIG_PASSPHRASE: ci-prod-passphrase
+          PULUMI_CONFIG_PASSPHRASE: ''
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
           APP_IMAGE: ${{ steps.resolve.outputs.image_by_digest }}
           REV: ${{ steps.resolve.outputs.digest }}
@@ -110,5 +110,5 @@ jobs:
               fs.writeFileSync("secrets/storage_secret_key", randomBytes(16).toString("hex"));
             '
           fi
-          bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select dev --create && pulumi --cwd infra up --yes --non-interactive'
+          bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra stack select ci --create && pulumi --cwd infra up --yes --non-interactive'
           kubectl -n broker-hw28 rollout status deployment/broker-api --timeout=180s
