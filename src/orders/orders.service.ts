@@ -8,6 +8,8 @@ import { randomUUID } from 'node:crypto';
 import { InstrumentsService } from '../instruments/instruments.service';
 import { OrderEventsService } from './order-events.service';
 import { AccessTokenPayload } from '../auth/jwt.service';
+import { OrdersRepository } from './orders.repository';
+import { createLayerLogger } from '../observability/logger';
 
 export interface Order {
   id: string;
@@ -34,94 +36,29 @@ export interface CreateOrderDto {
 
 @Injectable()
 export class OrdersService {
-  private orders: Order[] = [
-    {
-      id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
-      account_id: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
-      symbol: 'AAPL',
-      side: 'BUY',
-      type: 'MARKET',
-      quantity: 10,
-      limit_price_cents: null,
-      execution_price_cents: 22050,
-      fee_cents: 150,
-      total_cents: 220650,
-      status: 'FILLED',
-      created_at: '2026-09-16T10:00:00Z',
-    },
-    {
-      id: 'c2eebc99-9c0b-4ef8-bb6d-6bb9bd380a33',
-      account_id: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
-      symbol: 'GOOGL',
-      side: 'BUY',
-      type: 'LIMIT',
-      quantity: 5,
-      limit_price_cents: 17500,
-      execution_price_cents: 17500,
-      fee_cents: 150,
-      total_cents: 87650,
-      status: 'FILLED',
-      created_at: '2026-09-16T10:05:00Z',
-    },
-    {
-      id: 'd3eebc99-9c0b-4ef8-bb6d-6bb9bd380a44',
-      account_id: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
-      symbol: 'MSFT',
-      side: 'SELL',
-      type: 'MARKET',
-      quantity: 2,
-      limit_price_cents: null,
-      execution_price_cents: 43000,
-      fee_cents: 150,
-      total_cents: 86150,
-      status: 'FILLED',
-      created_at: '2026-09-16T10:10:00Z',
-    },
-  ];
-  private idempotencyStore = new Map<
-    string,
-    { body: CreateOrderDto; response: Order }
-  >();
-  private orderOwners = new Map<string, string>();
+  private readonly logger = createLayerLogger('orders.service');
 
   constructor(
     private readonly instrumentsService: InstrumentsService,
     private readonly orderEventsService: OrderEventsService,
+    private readonly ordersRepository: OrdersRepository,
   ) {}
 
   updateStatus(id: string, status: string): Order {
-    let order = this.orders.find((o) => o.id === id);
-    if (!order) {
-      order = {
-        id,
-        account_id: 'b1febc99-9c0b-4ef8-bb6d-6bb9bd380a22',
-        symbol: 'AAPL',
-        side: 'BUY',
-        type: 'MARKET',
-        quantity: 1,
-        limit_price_cents: null,
-        execution_price_cents: 10000,
-        fee_cents: 150,
-        total_cents: 10150,
-        status: status as any,
-        created_at: new Date().toISOString(),
-      };
-      this.orders.push(order);
-    } else {
-      order.status = status as any;
-    }
-
+    this.logger.info({ orderId: id, status }, 'service updateStatus');
+    const order = this.ordersRepository.upsertStatus(id, status);
     this.orderEventsService.emitOrderStatus(id, status, { order });
     return order;
   }
 
-  create(
+  async create(
     idempotencyKey: string,
     dto: CreateOrderDto,
     ownerUserId?: string,
-  ): { order: Order; isReplay: boolean } {
-    if (this.idempotencyStore.has(idempotencyKey)) {
-      const cached = this.idempotencyStore.get(idempotencyKey)!;
+  ): Promise<{ order: Order; isReplay: boolean }> {
+    this.logger.info({ symbol: dto.symbol }, 'service create order');
+    const cached = this.ordersRepository.findIdempotency(idempotencyKey);
+    if (cached) {
       if (JSON.stringify(cached.body) === JSON.stringify(dto)) {
         return { order: cached.response, isReplay: true };
       }
@@ -157,16 +94,12 @@ export class OrdersService {
       created_at: new Date().toISOString(),
     };
 
-    this.orders.push(newOrder);
-    if (ownerUserId) {
-      this.orderOwners.set(orderId, ownerUserId);
-    }
-    this.idempotencyStore.set(idempotencyKey, { body: dto, response: newOrder });
-
+    await this.ordersRepository.save(newOrder, idempotencyKey, dto, ownerUserId);
     return { order: newOrder, isReplay: false };
   }
 
   findAll(limit: number = 20, cursor?: string, user?: AccessTokenPayload) {
+    this.logger.info({ limit }, 'service findAll');
     let startIndex = 0;
     if (cursor) {
       const decoded = parseInt(Buffer.from(cursor, 'base64').toString('utf-8'), 10);
@@ -175,10 +108,14 @@ export class OrdersService {
       }
     }
 
+    const allOrders = this.ordersRepository.findAll();
     const visibleOrders =
       user && user.role !== 'ADMIN'
-        ? this.orders.filter((o) => (this.orderOwners.get(o.id) ?? o.account_id) === user.sub)
-        : this.orders;
+        ? allOrders.filter(
+            (o) =>
+              (this.ordersRepository.getOwner(o.id) ?? o.account_id) === user.sub,
+          )
+        : allOrders;
 
     const items = visibleOrders.slice(startIndex, startIndex + limit);
     const nextIndex = startIndex + limit;
@@ -190,13 +127,18 @@ export class OrdersService {
     return { items, next_cursor };
   }
 
-  findById(id: string, user?: AccessTokenPayload): Order {
-    const order = this.orders.find((o) => o.id === id);
+  async findById(
+    id: string,
+    user?: AccessTokenPayload,
+    delayMs?: number,
+  ): Promise<Order> {
+    this.logger.info({ orderId: id }, 'service findById');
+    const order = await this.ordersRepository.findById(id, delayMs);
     if (!order) {
       throw new NotFoundException(`Order with id '${id}' not found`);
     }
     // Ownership check lives in the service after loading the resource, not in the auth guard
-    const ownerId = this.orderOwners.get(order.id) ?? order.account_id;
+    const ownerId = this.ordersRepository.getOwner(order.id) ?? order.account_id;
     if (user && user.role !== 'ADMIN' && ownerId !== user.sub) {
       throw new ForbiddenException('You do not have permission to access this order');
     }

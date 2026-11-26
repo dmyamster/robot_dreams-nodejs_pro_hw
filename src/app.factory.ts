@@ -3,6 +3,7 @@ import { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ProblemExceptionFilter } from './common/filters/problem-exception.filter';
+import { httpObservabilityMiddleware } from './observability/http-observability.middleware';
 import * as OpenApiValidator from 'express-openapi-validator';
 import * as express from 'express';
 import * as path from 'node:path';
@@ -24,10 +25,11 @@ export function configureApp(app: INestApplication): INestApplication {
   });
 
   app.setGlobalPrefix('api/v1', {
-    exclude: ['health', 'api/v1/health', 'healthz', 'readyz'],
+    exclude: ['health', 'api/v1/health', 'healthz', 'readyz', 'metrics'],
   });
 
   app.use(express.json());
+  app.use(httpObservabilityMiddleware);
 
   app.enableCors();
 
@@ -40,6 +42,7 @@ export function configureApp(app: INestApplication): INestApplication {
       ignorePaths: (reqPath: string) =>
         reqPath.includes('health') ||
         reqPath.includes('readyz') ||
+        reqPath.includes('metrics') ||
         reqPath.includes('events') ||
         reqPath.includes('status'),
     }),

@@ -1,0 +1,144 @@
+{
+  "Role": {
+    "Path": "/",
+    "RoleName": "hw31-ci-teardown-role",
+    "RoleId": "AROAUUJPMU35HUMBUQOSC",
+    "Arn": "arn:aws:iam::318463846138:role/hw31-ci-teardown-role",
+    "CreateDate": "2026-11-26T14:58:22+00:00",
+    "AssumeRolePolicyDocument": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::318463846138:oidc-provider/token.actions.githubusercontent.com"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+            },
+            "StringLike": {
+              "token.actions.githubusercontent.com:sub": "repo:dmyamster*/robot_dreams-nodejs_pro_hw*:*"
+            }
+          }
+        }
+      ]
+    },
+    "Description": "Least-privilege OIDC role for GitHub Actions teardown of HW31 demo stack",
+    "MaxSessionDuration": 3600,
+    "MaxSigninSessionDuration": 3600,
+    "Tags": [
+      {
+        "Key": "ManagedBy",
+        "Value": "pulumi"
+      },
+      {
+        "Key": "Project",
+        "Value": "nodejs-pro-hw31"
+      },
+      {
+        "Key": "Stack",
+        "Value": "base"
+      }
+    ],
+    "RoleLastUsed": {}
+  },
+  "PolicyName": "hw31-ci-teardown-policy-cd830cf",
+  "PolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Action": [
+          "rds:DescribeDBInstances",
+          "rds:DeleteDBInstance",
+          "rds:ModifyDBInstance",
+          "rds:ListTagsForResource",
+          "rds:DescribeDBSubnetGroups",
+          "rds:DeleteDBSubnetGroup",
+          "rds:DescribeDBParameterGroups",
+          "rds:DeleteDBParameterGroup"
+        ],
+        "Effect": "Allow",
+        "Resource": "*",
+        "Sid": "RdsTeardownAndVerify"
+      },
+      {
+        "Action": [
+          "elasticloadbalancing:DescribeLoadBalancers",
+          "elasticloadbalancing:DescribeLoadBalancerAttributes",
+          "elasticloadbalancing:DeleteLoadBalancer",
+          "elasticloadbalancing:DescribeTargetGroups",
+          "elasticloadbalancing:DescribeTargetGroupAttributes",
+          "elasticloadbalancing:DeleteTargetGroup",
+          "elasticloadbalancing:DescribeListeners",
+          "elasticloadbalancing:DescribeListenerAttributes",
+          "elasticloadbalancing:DeleteListener",
+          "elasticloadbalancing:DescribeTags",
+          "elasticloadbalancing:DescribeTargetHealth",
+          "elasticloadbalancing:DeregisterTargets"
+        ],
+        "Effect": "Allow",
+        "Resource": "*",
+        "Sid": "ElbTeardownAndVerify"
+      },
+      {
+        "Action": [
+          "ec2:DescribeNatGateways",
+          "ec2:DeleteNatGateway",
+          "ec2:DescribeAddresses",
+          "ec2:ReleaseAddress",
+          "ec2:DescribeVpcs",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeRouteTables",
+          "ec2:DescribeInternetGateways",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DeleteNetworkInterface",
+          "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeTags"
+        ],
+        "Effect": "Allow",
+        "Resource": "*",
+        "Sid": "Ec2NetworkAndNatTeardown"
+      },
+      {
+        "Action": [
+          "lambda:GetFunction",
+          "lambda:GetFunctionConfiguration",
+          "lambda:DeleteFunction",
+          "lambda:GetPolicy",
+          "lambda:RemovePermission",
+          "lambda:ListVersionsByFunction",
+          "lambda:ListTags"
+        ],
+        "Effect": "Allow",
+        "Resource": "*",
+        "Sid": "LambdaTargetTeardown"
+      },
+      {
+        "Action": [
+          "iam:GetRole",
+          "iam:DeleteRole",
+          "iam:GetRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:ListRolePolicies",
+          "iam:ListAttachedRolePolicies",
+          "iam:ListInstanceProfilesForRole"
+        ],
+        "Effect": "Allow",
+        "Resource": "arn:aws:iam::*:role/hw31-*",
+        "Sid": "IamLambdaRoleCleanup"
+      },
+      {
+        "Action": [
+          "tag:GetResources"
+        ],
+        "Effect": "Allow",
+        "Resource": "*",
+        "Sid": "TaggingVerification"
+      }
+    ]
+  }
+}

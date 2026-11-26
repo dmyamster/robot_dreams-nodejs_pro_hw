@@ -98,6 +98,94 @@ User 1──1 Account 1──n Position n──1 StockInstrument
 
 ## Запуск
 
+### Схема архітектури
+
+```mermaid
+flowchart LR
+  Client["Client / Swagger / Pact / Tests"] -->|"HTTP + JWT (ES256) + Idempotency-Key"| API["NestJS API<br/>OpenAPI Validator + ProblemExceptionFilter"]
+  API -->|"Controller → Service → Repository"| PG[("PostgreSQL 16<br/>via PgBouncer (transaction mode)")]
+  API -->|"Cache-aside & Rate-limit"| RedisCache[("Redis Cache<br/>allkeys-lru")]
+  API -->|"BullMQ & Sessions"| RedisQueue[("Redis Queue<br/>noeviction + AOF")]
+  API -->|"Transactional Outbox Relay"| RMQ["RabbitMQ<br/>(confirm + DLX/DLQ)"]
+  RMQ -->|"Consumer (ack after effect)"| WS["Realtime<br/>Socket.IO Rooms & SSE"]
+  Client -->|"Presigned PUT/GET"| MinIO["MinIO S3 + Edge CDN"]
+  API -.->|"Pino JSON + OTel + RED Metrics"| Obs["Prometheus + Grafana + Tempo/OTLP"]
+```
+
+- **API-контракт:** [openapi/openapi.yaml](openapi/openapi.yaml) (OpenAPI 3.0.3, `express-openapi-validator`, RFC 7807 `application/problem+json`, cursor-пагінація, `Idempotency-Key`).
+- **Дашборд моніторингу:** [observability/grafana/dashboards/broker-red.json](observability/grafana/dashboards/broker-red.json) (RED-метрики, Prometheus + OTel).
+- **CI/CD та розгортання:** [.github/workflows/ci.yml](.github/workflows/ci.yml) (Quality Gates, Trivy image scan, Pulumi Cost Gate, OIDC Gate, Kind zero-downtime rollout).
+
+### Таблиця блоків (блок → шлях → чим замінено)
+
+| Блок | Статус | Шлях | Реалізація в проєкті | Чим замінено і чому | Доказ / команда перевірки |
+| --- | --- | --- | --- | --- | --- |
+| **11.1 Архітектура та структура рішення** | Реалізовано | Шлях курсу | NestJS модульний моноліт (`Controller → Service → Repository`), `zod` env-валідація, `README.md` (домен, trade-offs, журнал рішень, схема) | Без замін | `npm run check:env`, `npx depcruise --config .dependency-cruiser.cjs src` |
+| **11.2 Основний бізнес-контур та API** | Реалізовано | Шлях курсу | OpenAPI 3.0.3 + `express-openapi-validator` (Варіант Б), `application/problem+json`, `checkout` з транзакційним захистом, ідемпотентність від бізнес-сутності | Без замін | `npm run lint:spec`, `npm run demo:race`, `npm run demo:outbox` |
+| **11.3 Зберігання даних** | Реалізовано | Шлях курсу | PostgreSQL 16 + TypeORM міграції з відкатом, індекси (B-Tree, GIN, partial) + усунення N+1, PgBouncer (`transaction` mode), `restore-drill.sh` (**RTO = 15 с**, **RPO = 24 год**), 2× Redis (`allkeys-lru` / `noeviction`), MinIO presigned + Edge CDN | Без замін | `npm run migrate:revert && npm run migrate`, `npm run demo:nplus1`, `npm run restore:drill`, `npm run demo:cache`, `npm run demo:upload`, `npm run demo:cdn` |
+| **11.4 Безпека та валідація** | Реалізовано | Шлях курсу | Асиметричний JWT (`ES256` з allowlist) + opaque refresh з reuse detection, RBAC + перевірка власності (`401` vs `403`), `express-openapi-validator`, `scripts/with-secrets.sh` (Infisical / локальний fallback поза git/образом), Redis rate-limit (`429` + `Retry-After`) | Без замін | `npm run demo:reuse`, `npm run demo:rbac`, `npm run demo:ratelimit`, `git check-ignore -v .env` |
+| **11.5 Фонова або асинхронна обробка** | Реалізовано | Шлях курсу | RabbitMQ + Transactional Outbox (`FOR UPDATE SKIP LOCKED`), `confirm` + ручний `ack` після ефекту, персистентний дедуп, retry на `40001`/`40P01`, DLQ, BullMQ, Socket.IO кімнати + SSE (`Last-Event-ID`) | Без замін | `npm run demo:crash-write`, `npm run demo:crash-relay`, `npm run demo:duplicate`, `npm run demo:dlq`, `npm run demo:workers`, `node scripts/realtime-demo.mjs` |
+| **11.6 Docker та зовнішній деплой** | Реалізовано | Шлях курсу | `docker-compose.yml` (`--wait`), multi-stage distroless `docker/Dockerfile` + Trivy `npm run scan`, Pulumi + Kind (`maxUnavailable: 0`, PDB, HPA, `SIGTERM` drain), GitHub Actions OIDC + digest promote у Kind | Без замін | `docker compose up -d --wait`, `npm run demo:image`, `npm run demo:rollout`, `npm run demo:pdb`, [.github/workflows/ci.yml](.github/workflows/ci.yml) |
+| **11.7 Спостережуваність, тести та pipeline** | Реалізовано | Шлях курсу | Розділені `/healthz` та `/readyz` (червоніє на `SIGTERM`), Pino JSON-логи з `trace_id` через `AsyncLocalStorage`, Prometheus RED + OTel трейси + Grafana, Testcontainers integration + Supertest e2e + Pact, GitHub Actions CI | Без замін | `npm run demo:logs`, `npm run demo:metrics`, `npm run demo:trace`, `npm run test:integration`, `npm run test:e2e`, `npm run test:contract` |
+
+### Головний наскрізний контур (10 ланок)
+
+1. **API-запит:** клієнт надсилає `POST /api/v1/orders` з `Authorization: Bearer <token>` та `Idempotency-Key`.
+2. **Валідація:** `express-openapi-validator` перевіряє заголовки, тіло та схему за [openapi/openapi.yaml](openapi/openapi.yaml) (при помилці — `400 application/problem+json`).
+3. **Авторизація:** `JwtAuthGuard` (перевірка `ES256` і denylist) та перевірка власності рахунку (`401` / `403`).
+4. **Бізнес-логіка:** атомарне резервування/списання коштів під конкуренцією без oversell і lost update (`src/checkout.ts`).
+5. **Збереження:** замовлення, баланс і подія в `outbox` фіксуються в PostgreSQL в одній транзакції.
+6. **Фонова обробка:** `OutboxRelay` забирає подію (`FOR UPDATE SKIP LOCKED`) → публікує в RabbitMQ → споживач оновлює статус (`FILLED`) і надсилає push у Socket.IO-кімнату / SSE.
+7. **Повторне читання:** `GET /api/v1/orders/:id` повертає оновлений статус ордера.
+8. **Спостережуваність:** кожен шар (`controller → service → repository`) пише структурні логи з одним `trace_id`, експортуються RED-метрики та OTel-трейси.
+9. **Автоматизовані тести:** контур покритий `test:e2e`, `test:integration` (проти реального PostgreSQL) та `test:contract`.
+10. **Розгортання:** сервіс збирається у distroless-образ і розгортається через Pulumi у Kind (включно з CI-прогоном у [.github/workflows/ci.yml](.github/workflows/ci.yml)).
+
+### Єдиний Runbook локального запуску (з чистого клону)
+
+```bash
+# 1. Встановити залежності та перевірити контракт змінних оточення
+npm ci
+npm run check:env
+
+# 2. Підняти всі інфраструктурні сервіси (PostgreSQL, PgBouncer, RabbitMQ, 2x Redis, MinIO, Pact Broker)
+docker compose up -d --wait
+
+# 3. Зібрати застосунок, прогнати міграції та ідемпотентний seed
+npm run build
+npm run migrate
+npm run seed
+
+# 4. Запустити сервіс (секрети підтягуються з Infisical або локального ./secrets fallback)
+npm run start:vault
+```
+
+Перевірка health-проб та базових тестів після запуску:
+
+```bash
+curl -s http://localhost:3000/healthz
+curl -s http://localhost:3000/readyz
+npm run test:integration && npm run test:integration
+npm run test:e2e
+```
+
+> Детальні сценарії та демо-команди для кожного окремого блока наведені нижче у відповідних розділах ДЗ та в секціях `## Grading`.
+
+### OWASP Top 10:2025 (карта безпеки сервісу)
+
+| Категорія OWASP Top 10:2025 | Чи застосовна | Що зроблено в проєкті / чому не робимо |
+| --- | --- | --- |
+| **A01 Broken Access Control** | Так | `JwtAuthGuard` + `RolesGuard` (`INVESTOR` / `ADMIN`), перевірка власності ресурсів (`Account`, `Order`) на рівні сервісу (`401` vs `403`), ізоляція Socket.IO-кімнат по власнику, приватний S3-бакет із presigned URL. |
+| **A02 Security Misconfiguration** | Так | Валідація `env` при старті через `zod` (падіння з `exit ≠ 0`), multi-stage distroless Docker-образ без shell і не від `root`, заборона `synchronize: true` у TypeORM. |
+| **A03 Software Supply Chain Failures** | Так | Зафіксований `package-lock.json`, `npm ci`, SHA-пінування GitHub Actions (`uses: ...@<sha>`), сканування Docker-образу через Trivy з числовим порогом (`npm run scan`). |
+| **A04 Cryptographic Failures** | Так | Підпис JWT асиметричним `ES256` (P-256) з явним allowlist алгоритмів, хешування refresh-токенів із `REFRESH_TOKEN_PEPPER`, секрети поза кодом і поза шарами образу (`scripts/with-secrets.sh`, K8s `Secret`). |
+| **A05 Injection** | Так | Параметризовані запити TypeORM / `pg` без конкатенації SQL, строга валідація входу через `express-openapi-validator` до бізнес-логіки. |
+| **A06 Insecure Design** | Так | Транзакційне блокування ресурсу під конкуренцією (`demo:race`), обов'язковий `Idempotency-Key`, Transactional Outbox із персистентним дедупом, захист від replay/reuse refresh-токенів із відкликанням усієї сім'ї. |
+| **A07 Authentication Failures** | Так | Короткий TTL access-токена (900 с), opaque refresh-токен з одноразовою ротацією та reuse detection, logout через Redis denylist, rate limiting із `429` і `Retry-After`. |
+| **A08 Software or Data Integrity Failures** | Так | Перевірка підписів вебхуків (`timingSafeEqual` над сирим тілом), promote Docker-образу в CI виключно за `@digest`, OIDC-гейт у CI без довгоживучих ключів. |
+| **A09 Security Logging and Monitoring Failures** | Так | Структурні JSON-логи (Pino + `AsyncLocalStorage` `trace_id`) з маскуванням секретів (`secret-in-logs=0`), RED-метрики в Prometheus, OTel-трейси та дашборд у Grafana. |
+| **A10 Mishandling of Exceptional Conditions** | Так | Єдиний глобальний `ProblemExceptionFilter` (`application/problem+json` для 4xx/5xx), цільовий retry лише на `40001`/`40P01`, відправка отруєних повідомлень у DLQ з причиною, коректний `SIGTERM` drain (`readyz` → 503). |
+
 ## ДЗ #9: API Design та Контракт (Варіант Б на NestJS)
 
 Для виконання контрактної частини обрано **Варіант Б (Runtime-валідація на кордоні)**, реалізований на повноцінному **NestJS + TypeScript**:
@@ -1398,6 +1486,225 @@ console.log("посилань на Secret =", refs); process.exit(refs>=1?0:1)'
 
 # Прибирання після перевірки
 npm run destroy && npm run cluster:down
+```
+
+## Observability
+
+Локальний стек спостережуваності підіймається з [`observability/docker-compose.yml`](observability/docker-compose.yml):
+- **Prometheus** (`:22901` → `9090`) — скрейпить `GET /metrics` кожні `5s`.
+- **Jaeger** (`:22917` OTLP gRPC, `:22918` OTLP HTTP, `:22904` Query/UI) — приймає спани OpenTelemetry та надає HTTP API `/api/traces/<traceId>`.
+- **Grafana** (`:22930` → `3000`) — автоматично провіженить datasource `Prometheus` та дашборд [`observability/grafana/dashboards/broker-red.json`](observability/grafana/dashboards/broker-red.json).
+
+Заміри памʼяті (`docker stats --no-stream`):
+- Базовий стек (`postgres`, `pgbouncer`, `rabbitmq`, `redis-cache`, `redis-queue`, `minio`, `pact-broker`): ~`719 MiB`.
+- Після додавання стеку спостережуваності (`broker_grafana` ~`69.7 MiB`, `broker_prometheus` ~`22.9 MiB`, `broker_jaeger` ~`13.3 MiB`): разом ~`742 MiB` з `7.748 GiB` ліміту.
+
+### Змінні оточення
+
+| Змінна | Призначення | Джерело |
+| --- | --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Базовий URL OTLP/HTTP колектора трейсів (`http://127.0.0.1:22918`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `OTEL_SERVICE_NAME` | Імʼя сервісу в спанах та логах (`paper-trading-broker-api`) | `env.schema.ts` / середовище |
+| `PROMETHEUS_URL` | URL Prometheus для перевірки готовності та запитів (`http://127.0.0.1:22901`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `TRACE_API_URL` | URL API бекенда трейсів Jaeger (`http://127.0.0.1:22904`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `GRAFANA_USER` | Логін адміністратора Grafana (`admin`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `GRAFANA_PASSWORD` | Пароль адміністратора Grafana (`admin`) | `scripts/with-secrets.sh` / Vault (`SKIP_VAULT=1` для грейдера) |
+| `LOG_LEVEL` | Рівень логування `pino` (`info`) | `env.schema.ts` / середовище |
+
+### Панелі RED у Grafana
+
+1. **Rate — HTTP Requests per Second** (скільки запитів на секунду обробляє кожен маршрут):
+   ```promql
+   sum(rate(http_requests_total[1m])) by (route, method)
+   ```
+2. **Errors — 5xx Error Ratio** (яка частка запитів завершується серверною помилкою 5xx):
+   ```promql
+   sum(rate(http_requests_total{status=~"5.."}[1m])) / clamp_min(sum(rate(http_requests_total[1m])), 1e-9)
+   ```
+3. **Duration — Request Latency Quantiles (p50 / p95 / p99)** (скільки часу триває обробка запиту за квантилями):
+   ```promql
+   histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[1m])) by (le, route))
+   ```
+
+### Межі бакетів гістограми
+
+Для `http_request_duration_seconds` задано бакети:
+`[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15]` (секунди).
+Верхній скінченний бакет `le="15"` перевищує найгірший випадок (контрольована затримка до `5s` у контролері та `1.1s` у `demo:metrics`), тому `histogram_quantile` не впирається у верхню межу і `above-top-bucket=0`. Лейбл `route` нормалізується до шаблону маршруту Express (наприклад, `/api/v1/orders/:id`), що гарантує обмежену кардинальність часових рядів.
+
+### Результати прогонів демо (3 прогони)
+
+- `npm run demo:logs`:
+  `non-json-lines=0`, `layers=3`, `distinct-trace-ids=1`, `trace-id-matches-header=1`, `burst=8`, `burst-trace-ids=8`, `burst-uneven=0`, `secret-req-logged=1`, `secret-in-logs=0`
+- `npm run demo:metrics`:
+  `sent-ok=145`, `sent-fail=10`, `counter-delta=155`, `errors-delta=10`, `above-top-bucket=0`, `series-before=3`, `series-after=3`
+- `npm run demo:trace`:
+  `spans=16`, `orphan-spans=0`, `trace-matches-header=1`, `trace-matches-log=1`, `span-status-error=1`
+
+## CI/CD
+
+Конвеєр як код складається з трьох воркфлоу у `.github/workflows/`:
+- [`ci.yml`](.github/workflows/ci.yml) (`pull_request`, `workflow_dispatch`):
+  1. **`gates`**: 4 сходинки якості — `tsc --noEmit` + `eslint`, контракт OpenAPI (`oasdiff breaking`), архітектурні межі (`dependency-cruiser`).
+  2. **`build`** (`needs: gates`): єдине місце збірки образу (`docker/build-push-action`), публікація в GHCR, запис `build.log` (1 рядок), сканування Trivy (`npm run scan`, поріг `SCAN_MAX=100`). Віддає `digest` у `outputs`.
+  3. **`cost-gate`** (`needs: gates`): `pulumi preview --json > plan.json` + гейт вартості (`npm run gate:cost`, `src/mapping.ts`).
+  4. **`oidc-rollout`** (`needs: [build, cost-gate]`): запит OIDC-токена (`permissions: id-token: write` лише на рівні джоби), криптографічна перевірка підпису й політики [`oidc/policy.json`](oidc/policy.json) через [`scripts/oidc-gate.mjs`](scripts/oidc-gate.mjs), підняття `kind`-кластера `broker-hw28`, завантаження образу за `@digest` (`needs.build.outputs.digest`), деплой через `pulumi up`, прогін `MIN_REQUESTS=2000 bash demo/demo-rollout.sh` (`failed=0`) та вивантаження артефакту `pipeline-evidence` (`if: always()`).
+- [`deploy.yml`](.github/workflows/deploy.yml) (`push` у `main`, `workflow_dispatch`): промоушн вже зібраного образу за `@digest` у середовище `production` після перевірки OIDC-токена (без повторної збірки).
+- [`teardown.yml`](.github/workflows/teardown.yml) (`schedule`, `workflow_dispatch`): автоматичне прибирання AWS-стеку з ДЗ #31.
+
+### Секрети конвеєра (`${{ secrets.* }}`)
+
+Довгоживучих хмарних ключів (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` тощо) у секретах репозиторію чи середовищ немає (`0`).
+
+| Секрет | Призначення |
+|---|---|
+| `GITHUB_TOKEN` | Автоматичний токен GitHub Actions (`packages: write` для публікації образу в GHCR, `packages: read` для pull за digest) |
+| `VAULT_TOKEN` | Доступ до сховища секретів застосунку з ДЗ #11 (`scripts/with-secrets.sh`); не відкриває хмару або реєстр |
+| `PULUMI_ACCESS_TOKEN` | Токен Pulumi Cloud для автоматичного teardown AWS-інфраструктури у `teardown.yml` (ДЗ #31) |
+
+### Змінні застосунку зі сховища
+
+| Змінна | Джерело | Куди потрапляє |
+|---|---|---|
+| `DB_PASSWORD` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `JWT_PRIVATE_KEY` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `JWT_PUBLIC_KEY` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `REFRESH_TOKEN_PEPPER` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `STORAGE_ACCESS_KEY` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+| `STORAGE_SECRET_KEY` | сховище (ДЗ #11 / `scripts/with-secrets.sh`) | K8s Secret `broker-secrets` (`envFrom.secretRef`) |
+
+### Межа маскування секретів
+
+Маскування логів у GitHub Actions замінює лише точне входження значення у stdout/stderr; воно не спрацьовує, якщо значення перекодоване (base64, hex), розрізане або надруковане серіалізатором. Тому в конвеєрі відсутні `env`, `printenv`, `set -x` та `echo "$SECRET"` у кроках із доступом до секретів, а секрети застосунку передаються у под лише посиланням (`secretRef`) у момент запуску, а не під час `docker build`.
+
+### Ставки та обхід гейта вартості (`src/mapping.ts`)
+
+Джерело ставок: [AWS Fargate Pricing (`eu-central-1`, 730 год/міс)](https://aws.amazon.com/fargate/pricing/):
+- vCPU: `$0.04656 / vCPU-год` (`$33.9888 / vCPU-міс`)
+- Memory: `$0.00511 / GiB-год` (`$3.7303 / GiB-міс`)
+- Для `broker-api` (`replicas=2`, `50m` CPU, `128Mi` RAM): `plan-usd = $4.33/міс` (бюджет PR-гейта за замовчуванням: `$10/міс`).
+
+cost-gate-bypass-label: cost-approved
+
+## Grading
+
+```bash
+git clone https://github.com/dmyamster/robot_dreams-nodejs_pro_hw.git && cd robot_dreams-nodejs_pro_hw && git checkout hw-32
+npm ci
+export SKIP_VAULT=1
+export DB_PASSWORD=grader-secret
+export REFRESH_TOKEN_PEPPER=grader-pepper-at-least-32-bytes-long
+export STORAGE_ACCESS_KEY=grader-access
+export STORAGE_SECRET_KEY=grader-secret-key
+
+npm run demo:gates
+npm run demo:oidc
+
+PLAN_JSON=/tmp/hw32/plan.json COST_BUDGET_USD=0 npm run gate:cost
+PLAN_JSON=/tmp/hw32/plan.json COST_BUDGET_USD=999999 npm run gate:cost
+```
+
+<details>
+<summary>Попередні налаштування Grading (Observability / #28)</summary>
+
+```bash
+docker compose up -d --wait
+docker compose -f observability/docker-compose.yml up -d --wait
+
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:22918
+export PROMETHEUS_URL=http://127.0.0.1:22901
+export TRACE_API_URL=http://127.0.0.1:22904
+export GRAFANA_USER=admin
+export GRAFANA_PASSWORD=admin
+export REDIS_URL=redis://127.0.0.1:6379
+export REDIS_QUEUE_URL=redis://127.0.0.1:6380
+export DATABASE_URL=postgres://postgres:super_secret_db_pass_123@127.0.0.1:5432/broker_db
+export STORAGE_ENDPOINT=http://127.0.0.1:22650
+export STORAGE_REGION=us-east-1
+export STORAGE_BUCKET=hw26-files
+export STORAGE_ACCESS_KEY=hw26user
+export STORAGE_SECRET_KEY=hw26secretpass
+export REFRESH_TOKEN_PEPPER=grader-pepper-at-least-32-bytes-long
+export SKIP_VAULT=1
+
+node -e 'const {generateKeyPairSync}=require("node:crypto"),fs=require("node:fs");
+const k=generateKeyPairSync("ec",{namedCurve:"P-256",
+  privateKeyEncoding:{type:"pkcs8",format:"pem"},
+  publicKeyEncoding:{type:"spki",format:"pem"}});
+fs.writeFileSync("/tmp/priv.b64",Buffer.from(k.privateKey).toString("base64"));
+fs.writeFileSync("/tmp/pub.b64",Buffer.from(k.publicKey).toString("base64"));'
+export JWT_KID=grader
+export JWT_PRIVATE_KEY="$(cat /tmp/priv.b64)"
+export JWT_PUBLIC_KEY="$(cat /tmp/pub.b64)"
+
+npm ci
+npx tsc --noEmit
+npm run demo:logs
+npm run demo:metrics
+npm run demo:trace
+```
+
+</details>
+
+## AWS
+
+смуга: основна
+teardown-run: https://github.com/dmyamster/robot_dreams-nodejs_pro_hw/actions/runs/45858455775
+регіон: `eu-north-1` (Стокгольм; дозволений регіон Free Plan акаунта)
+
+Pulumi-програми знаходяться в [`infra/base`](infra/base) та [`infra/demo`](infra/demo), скрипти керування — у кореневому [`package.json`](package.json) (`up:base`, `up:demo`, `destroy:demo`, `destroy:base`, `demo:failover`, `demo:nat`, `demo:alb`).
+
+> **Примітка щодо Free Plan:** Якщо раніше вже був акаунт AWS, Free plan і Free Tier кредити недоступні — тарифікація йде з першої хвилини, тому `$5` бюджет та автоматичний CI teardown є єдиним захистом від небажаного рахунку.
+
+### Таблиця погодинної ставки (`eu-central-1`, місяць = 730 год)
+
+Джерело ставок: AWS Pricing (`eu-central-1`, знімок прайс-листа станом на 24.08.2026; ціль ALB — AWS Lambda, тому додатковий EC2 та його Public IPv4 відсутні).
+
+| Ресурс | Ставка / год | Місяць (730 год) | Примітка |
+|---|---:|---:|---|
+| Application Load Balancer (ALB) | `$0.02700` | `$19.71` | Internet-facing у 2 публічних підмережах |
+| Public IPv4 × 2 (під ALB) | `$0.01000` (`$0.005 × 2`) | `$7.30` | За кожну AZ, у якій стоїть ALB |
+| RDS `db.t4g.micro` PostgreSQL Multi-AZ instance | `$0.03700` | `$27.01` | Primary + synchronous standby |
+| RDS `gp3` 20 GiB (Multi-AZ) | `$0.00751` (`$0.274/ГіБ-міс × 20 ÷ 730`) | `$5.48` | Подвоєне сховище |
+| LCU (оцінка навчального навантаження) | `$0.00040` | `$0.29` | Припущення для тестового трафіку |
+| AWS Lambda (ціль ALB) | `$0.00000` | `$0.00` | Free Tier / одиничні запити |
+| **Разом (без NAT)** | **`$0.08191`** | **`$59.79`** | **4 год роботи ≈ `$0.33`, доба ≈ `$1.97`** |
+
+### IAM OIDC-роль (`hw31-ci-teardown-role`) та least-privilege дозволи
+
+GitHub Actions автентифікується через OIDC (`token.actions.githubusercontent.com`, `aud = sts.amazonaws.com`, `sub` обмежений до `repo:dmyamster/robot_dreams-nodejs_pro_hw:*`) без жодного статичного ключа в репозиторії чи GitHub Secrets.
+
+| Sid / Група дозволів | Дії (`Action`) | Навіщо |
+|---|---|---|
+| `RdsTeardownAndVerify` | `rds:DescribeDBInstances`, `rds:DeleteDBInstance`, `rds:ModifyDBInstance`, `rds:ListTagsForResource`, `rds:DescribeDBSubnetGroups`, `rds:DeleteDBSubnetGroup`, `rds:DescribeDBParameterGroups`, `rds:DeleteDBParameterGroup` | Видалення RDS-інстансу, subnet group та перевірка `rds-left=0` |
+| `ElbTeardownAndVerify` | `elasticloadbalancing:DescribeLoadBalancers`, `DeleteLoadBalancer`, `DescribeTargetGroups`, `DeleteTargetGroup`, `DescribeListeners`, `DeleteListener`, `DescribeTags`, `DescribeTargetHealth` | Видалення ALB, listener, target group та перевірка `alb-left=0` |
+| `Ec2NetworkAndNatTeardown` | `ec2:DescribeNatGateways`, `DeleteNatGateway`, `DescribeAddresses`, `ReleaseAddress`, `DescribeVpcs`, `DescribeSubnets`, `DescribeSecurityGroups`, `DescribeRouteTables`, `DescribeInternetGateways`, `DescribeNetworkInterfaces`, `DeleteNetworkInterface`, `DescribeTags` | Видалення NAT/EIP/ENI та перевірка `nat-left=0`, `eip-left=0` |
+| `LambdaTargetTeardown` | `lambda:GetFunction`, `DeleteFunction`, `GetPolicy`, `RemovePermission`, `ListVersionsByFunction` | Видалення Lambda-цілі та її resource policy |
+| `IamLambdaRoleCleanup` | `iam:GetRole`, `DeleteRole`, `GetRolePolicy`, `DeleteRolePolicy`, `DetachRolePolicy`, `ListRolePolicies`, `ListAttachedRolePolicies` (`arn:aws:iam::*:role/hw31-*`) | Видалення execution-ролі Lambda з `demo`-стеку |
+| `TaggingVerification` | `tag:GetResources` | Перевірка `tagged-resources-left=0` по `eu-central-1` та `us-east-1` |
+
+Перевірка `aws iam simulate-principal-policy` (позитивний та негативний тести) збережена у `evidence/iam.txt`:
+```bash
+aws iam simulate-principal-policy --policy-source-arn arn:aws:iam::318463846138:role/hw31-ci-teardown-role --action-names rds:DescribeDBInstances --context-entries ContextKeyName=aws:RequestedRegion,ContextKeyValues=eu-north-1,ContextKeyType=string   # -> allowed
+aws iam simulate-principal-policy --policy-source-arn arn:aws:iam::318463846138:role/hw31-ci-teardown-role --action-names iam:CreateUser --context-entries ContextKeyName=aws:RequestedRegion,ContextKeyValues=eu-north-1,ContextKeyType=string            # -> implicitDeny
+```
+
+> **Примітка про failover:** Під час живого тесту `--force-failover` перемикання `eu-north-1b → eu-north-1a` зайняло `166 с` (вилізло за типові `60–120 с`, що вкладається у допустиму вилку `20–600 с`).
+
+### RDS Multi-AZ проти мого стека з #15
+
+У ДЗ #15 база працювала як self-hosted `PostgreSQL` + `PgBouncer` (`pool_mode = transaction`) + `scripts/backup.sh` (`pg_dump -Fc` за cron) + `scripts/restore-drill.sh`.
+- **Що забирає на себе RDS Multi-AZ:** керування основним інстансом і синхронною standby-реплікою в іншій AZ, автоматичний failover з оновленням DNS-ендпоінту, автоматичні щоденні снапшоти та point-in-time recovery (`backupRetentionPeriod: 1`), патчі ОС/рушія та шифрування тому на рівні диска (`storageEncrypted: true`).
+- **Що все одно лишається тобі:** пулінг з'єднань (без `PgBouncer` або RDS Proxy при великій кількості коротких підключень додаток однаково вичерпає `max_connections` на `db.t4g.micro`), міграції схеми, тюнінг індексів/запитів та логічна перевірка відновлення (restore drill на рівні даних і бізнес-інваріантів).
+
+### KMS і сховище секретів (#11)
+
+AWS KMS не замінює сховище секретів із ДЗ #11 (`Infisical` / `scripts/with-secrets.sh`), а працює шаром під ним: KMS захищає кореневий ключ шифрування (наприклад, ключ диска RDS або `ENCRYPTION_KEY`, яким шифруються дані), тоді як сховище секретів керує доставкою прикладних креденшелів (`DB_PASSWORD`, `JWT_PRIVATE_KEY` тощо) у runtime. Власний customer-managed KMS key (CMK) свідомо не створювався, оскільки він додає окремий рядок у білінгу, який не зникає в день `destroy`. Для `storageEncrypted: true` використовується AWS-managed ключ (`aws/rds`).
+
+### Чим бекенд стану відрізняється від #28 і чому
+
+У ДЗ #28 використовувався локальний `file://`-бекенд (`.pulumi`), оскільки кластер `kind` і команди `pulumi up/destroy` запускалися лише з локальної машини. У ДЗ #31 стек `demo` має гарантовано зноситися автоматично через GitHub Actions (`.github/workflows/teardown.yml`), а воркер GitHub не має доступу до локального диска розробника. Тому використовується віддалений бекенд стану (Pulumi Cloud або S3-бекенд в AWS), доступний як локально, так і з CI-раннера.
+
 ```
 
 

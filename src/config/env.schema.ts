@@ -25,6 +25,11 @@ export const envSchema = z.object({
   STARTUP_WARMUP_MS: z.coerce.number().int().min(0).default(0),
   DRAIN_DELAY_MS: z.coerce.number().int().min(0).default(5000),
   REV: z.string().optional(),
+  OTEL_EXPORTER_OTLP_ENDPOINT: z.string().default('http://127.0.0.1:22918'),
+  OTEL_SERVICE_NAME: z.string().default('paper-trading-broker-api'),
+  LOG_LEVEL: z.string().default('info'),
+  PROMETHEUS_URL: z.string().default('http://127.0.0.1:22901'),
+  TRACE_API_URL: z.string().default('http://127.0.0.1:22904'),
 });
 
 export type Env = z.infer<typeof envSchema>;
