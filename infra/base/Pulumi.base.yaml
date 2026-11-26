@@ -1,0 +1,9 @@
+config:
+  aws:region: eu-north-1
+  aws:defaultTags:
+    tags:
+      Project: nodejs-pro-hw31
+      Stack: base
+      ManagedBy: pulumi
+  hw31-base:githubRepo: dmyamster/robot_dreams-nodejs_pro_hw
+  hw31-base:budgetAlertEmail: dmyamster@gmail.com

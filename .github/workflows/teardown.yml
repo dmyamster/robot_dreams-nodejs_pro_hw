@@ -1,0 +1,101 @@
+name: HW31 Teardown
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: eu-north-1
+      AWS_STS_REGIONAL_ENDPOINTS: regional
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+      PULUMI_BACKEND_URL: ${{ vars.PULUMI_BACKEND_URL }}
+      PULUMI_CONFIG_PASSPHRASE: ${{ vars.PULUMI_CONFIG_PASSPHRASE || 'hw31-teardown' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Pulumi CLI
+        uses: pulumi/actions@v5
+        with:
+          pulumi-version: '^3.150.0'
+
+      - name: Install infra/demo dependencies
+        working-directory: infra/demo
+        run: npm ci
+
+      - name: Destroy demo stack
+        working-directory: infra/demo
+        run: |
+          pulumi stack select demo || true
+          pulumi destroy --yes --non-interactive
+
+      - name: Verify zero resources left and print contract
+        working-directory: infra/demo
+        run: |
+          set -euo pipefail
+
+          STATE_LEFT=$(pulumi stack export | jq '[(.deployment.resources // [])[] | select(.type | startswith("aws:"))] | length')
+
+          TAGGED_LEFT=0
+          RDS_LEFT=0
+          ALB_LEFT=0
+          NAT_LEFT=0
+          EIP_LEFT=0
+
+          for R in "$AWS_REGION" us-east-1; do
+            t=0
+            for arn in $(aws resourcegroupstaggingapi get-resources --region "$R" \
+              --tag-filters Key=Project,Values=nodejs-pro-hw31 Key=Stack,Values=demo \
+              --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null || true); do
+              if [[ "$arn" == *:natgateway/* ]]; then
+                ngw_id="${arn##*/}"
+                ngw_state=$(aws ec2 describe-nat-gateways --region "$R" --nat-gateway-ids "$ngw_id" \
+                  --query 'NatGateways[0].State' --output text 2>/dev/null || echo "deleted")
+                [ "$ngw_state" = "deleted" ] && continue
+              fi
+              t=$((t + 1))
+            done
+            r=$(aws rds describe-db-instances --region "$R" --query 'length(DBInstances)' --output text 2>/dev/null || echo 0)
+            a=$(aws elbv2 describe-load-balancers --region "$R" --query 'length(LoadBalancers)' --output text 2>/dev/null || echo 0)
+            n=$(aws ec2 describe-nat-gateways --region "$R" --filter Name=state,Values=available --query 'length(NatGateways)' --output text 2>/dev/null || echo 0)
+            e=$(aws ec2 describe-addresses --region "$R" --query 'length(Addresses)' --output text 2>/dev/null || echo 0)
+
+            TAGGED_LEFT=$((TAGGED_LEFT + t))
+            RDS_LEFT=$((RDS_LEFT + r))
+            ALB_LEFT=$((ALB_LEFT + a))
+            NAT_LEFT=$((NAT_LEFT + n))
+            EIP_LEFT=$((EIP_LEFT + e))
+          done
+
+          echo "state-resources-left=${STATE_LEFT}"
+          echo "tagged-resources-left=${TAGGED_LEFT}"
+          echo "rds-left=${RDS_LEFT}"
+          echo "alb-left=${ALB_LEFT}"
+          echo "nat-left=${NAT_LEFT}"
+          echo "eip-left=${EIP_LEFT}"
+
+          test "$STATE_LEFT" -eq 0
+          test "$TAGGED_LEFT" -eq 0
+          test "$RDS_LEFT" -eq 0
+          test "$ALB_LEFT" -eq 0
+          test "$NAT_LEFT" -eq 0
+          test "$EIP_LEFT" -eq 0
