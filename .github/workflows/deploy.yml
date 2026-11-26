@@ -76,8 +76,13 @@ jobs:
 
       - name: Pull image by digest and load into Kind
         run: |
-          docker pull "${{ steps.resolve.outputs.image_by_digest }}"
-          kind load docker-image "${{ steps.resolve.outputs.image_by_digest }}" --name broker-hw28
+          IMAGE_BY_DIGEST="${{ steps.resolve.outputs.image_by_digest }}"
+          IMAGE_REPO="${IMAGE_BY_DIGEST%@*}"
+          IMAGE_TAG="${IMAGE_REPO}:promote"
+          docker pull "$IMAGE_BY_DIGEST"
+          docker tag "$IMAGE_BY_DIGEST" "$IMAGE_TAG"
+          kind load docker-image "$IMAGE_TAG" --name broker-hw28
+          docker exec broker-hw28-control-plane ctr -n k8s.io images tag "$IMAGE_TAG" "$IMAGE_BY_DIGEST" || true
 
       - name: Set up Pulumi CLI
         uses: pulumi/actions@0ce33695f880624d4f27bd6db25e680c7df4d551 # v7.2.0

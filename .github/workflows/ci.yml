@@ -253,7 +253,9 @@ jobs:
           IMAGE_REPO="${IMAGE_REF%:*}"
           IMAGE_BY_DIGEST="${IMAGE_REPO}@${BUILT_DIGEST}"
           docker pull "$IMAGE_BY_DIGEST"
-          kind load docker-image "$IMAGE_BY_DIGEST" --name broker-hw28
+          docker tag "$IMAGE_BY_DIGEST" "$IMAGE_REF"
+          kind load docker-image "$IMAGE_REF" --name broker-hw28
+          docker exec broker-hw28-control-plane ctr -n k8s.io images tag "$IMAGE_REF" "$IMAGE_BY_DIGEST" || true
 
       - name: Set up Pulumi CLI
         uses: pulumi/actions@0ce33695f880624d4f27bd6db25e680c7df4d551 # v7.2.0
