@@ -1,0 +1,3 @@
+name: hw31-demo
+runtime: nodejs
+description: Ephemeral hourly AWS resources for HW #31 (RDS Multi-AZ, ALB, Lambda target, optional NAT)

@@ -56,7 +56,15 @@
     "demo:pdb": "bash demo/demo-pdb.sh",
     "demo:logs": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-logs.js",
     "demo:metrics": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-metrics.js",
-    "demo:trace": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-trace.js"
+    "demo:trace": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/src/demo-trace.js",
+    "up:base": "bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra/base stack select base --create && pulumi --cwd infra/base up --yes --non-interactive'",
+    "up:demo": "bash scripts/with-secrets.sh dev bash -c 'pulumi --cwd infra/demo stack select demo --create && pulumi --cwd infra/demo up --yes --non-interactive'",
+    "destroy:demo": "bash scripts/with-secrets.sh dev pulumi --cwd infra/demo destroy --yes --non-interactive",
+    "destroy:base": "bash scripts/with-secrets.sh dev pulumi --cwd infra/base destroy --yes --non-interactive",
+    "evidence:base": "bash scripts/with-secrets.sh dev bash demo/collect-base-evidence.sh",
+    "demo:failover": "bash scripts/with-secrets.sh dev bash demo/demo-failover.sh",
+    "demo:nat": "bash scripts/with-secrets.sh dev bash demo/demo-nat.sh",
+    "demo:alb": "bash scripts/with-secrets.sh dev bash demo/demo-alb.sh"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1168.0",

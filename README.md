@@ -1492,6 +1492,67 @@ npm run demo:metrics
 npm run demo:trace
 ```
 
+## AWS
+
+смуга: основна
+teardown-run: PENDING_WORKFLOW_DISPATCH_RUN_URL
+регіон: `eu-north-1` (Стокгольм; дозволений регіон Free Plan акаунта)
+
+Pulumi-програми знаходяться в [`infra/base`](infra/base) та [`infra/demo`](infra/demo), скрипти керування — у кореневому [`package.json`](package.json) (`up:base`, `up:demo`, `destroy:demo`, `destroy:base`, `demo:failover`, `demo:nat`, `demo:alb`).
+
+> **Примітка щодо Free Plan:** Якщо раніше вже був акаунт AWS, Free plan і Free Tier кредити недоступні — тарифікація йде з першої хвилини, тому `$5` бюджет та автоматичний CI teardown є єдиним захистом від небажаного рахунку.
+
+### Таблиця погодинної ставки (`eu-central-1`, місяць = 730 год)
+
+Джерело ставок: AWS Pricing (`eu-central-1`, знімок прайс-листа станом на 24.08.2026; ціль ALB — AWS Lambda, тому додатковий EC2 та його Public IPv4 відсутні).
+
+| Ресурс | Ставка / год | Місяць (730 год) | Примітка |
+|---|---:|---:|---|
+| Application Load Balancer (ALB) | `$0.02700` | `$19.71` | Internet-facing у 2 публічних підмережах |
+| Public IPv4 × 2 (під ALB) | `$0.01000` (`$0.005 × 2`) | `$7.30` | За кожну AZ, у якій стоїть ALB |
+| RDS `db.t4g.micro` PostgreSQL Multi-AZ instance | `$0.03700` | `$27.01` | Primary + synchronous standby |
+| RDS `gp3` 20 GiB (Multi-AZ) | `$0.00751` (`$0.274/ГіБ-міс × 20 ÷ 730`) | `$5.48` | Подвоєне сховище |
+| LCU (оцінка навчального навантаження) | `$0.00040` | `$0.29` | Припущення для тестового трафіку |
+| AWS Lambda (ціль ALB) | `$0.00000` | `$0.00` | Free Tier / одиничні запити |
+| **Разом (без NAT)** | **`$0.08191`** | **`$59.79`** | **4 год роботи ≈ `$0.33`, доба ≈ `$1.97`** |
+
+### IAM OIDC-роль (`hw31-ci-teardown-role`) та least-privilege дозволи
+
+GitHub Actions автентифікується через OIDC (`token.actions.githubusercontent.com`, `aud = sts.amazonaws.com`, `sub` обмежений до `repo:dmyamster/robot_dreams-nodejs_pro_hw:*`) без жодного статичного ключа в репозиторії чи GitHub Secrets.
+
+| Sid / Група дозволів | Дії (`Action`) | Навіщо |
+|---|---|---|
+| `RdsTeardownAndVerify` | `rds:DescribeDBInstances`, `rds:DeleteDBInstance`, `rds:ModifyDBInstance`, `rds:ListTagsForResource`, `rds:DescribeDBSubnetGroups`, `rds:DeleteDBSubnetGroup`, `rds:DescribeDBParameterGroups`, `rds:DeleteDBParameterGroup` | Видалення RDS-інстансу, subnet group та перевірка `rds-left=0` |
+| `ElbTeardownAndVerify` | `elasticloadbalancing:DescribeLoadBalancers`, `DeleteLoadBalancer`, `DescribeTargetGroups`, `DeleteTargetGroup`, `DescribeListeners`, `DeleteListener`, `DescribeTags`, `DescribeTargetHealth` | Видалення ALB, listener, target group та перевірка `alb-left=0` |
+| `Ec2NetworkAndNatTeardown` | `ec2:DescribeNatGateways`, `DeleteNatGateway`, `DescribeAddresses`, `ReleaseAddress`, `DescribeVpcs`, `DescribeSubnets`, `DescribeSecurityGroups`, `DescribeRouteTables`, `DescribeInternetGateways`, `DescribeNetworkInterfaces`, `DeleteNetworkInterface`, `DescribeTags` | Видалення NAT/EIP/ENI та перевірка `nat-left=0`, `eip-left=0` |
+| `LambdaTargetTeardown` | `lambda:GetFunction`, `DeleteFunction`, `GetPolicy`, `RemovePermission`, `ListVersionsByFunction` | Видалення Lambda-цілі та її resource policy |
+| `IamLambdaRoleCleanup` | `iam:GetRole`, `DeleteRole`, `GetRolePolicy`, `DeleteRolePolicy`, `DetachRolePolicy`, `ListRolePolicies`, `ListAttachedRolePolicies` (`arn:aws:iam::*:role/hw31-*`) | Видалення execution-ролі Lambda з `demo`-стеку |
+| `TaggingVerification` | `tag:GetResources` | Перевірка `tagged-resources-left=0` по `eu-central-1` та `us-east-1` |
+
+Перевірка `aws iam simulate-principal-policy` (позитивний та негативний тести) збережена у `evidence/iam.txt`:
+```bash
+aws iam simulate-principal-policy --policy-source-arn arn:aws:iam::318463846138:role/hw31-ci-teardown-role --action-names rds:DescribeDBInstances --context-entries ContextKeyName=aws:RequestedRegion,ContextKeyValues=eu-north-1,ContextKeyType=string   # -> allowed
+aws iam simulate-principal-policy --policy-source-arn arn:aws:iam::318463846138:role/hw31-ci-teardown-role --action-names iam:CreateUser --context-entries ContextKeyName=aws:RequestedRegion,ContextKeyValues=eu-north-1,ContextKeyType=string            # -> implicitDeny
+```
+
+> **Примітка про failover:** Під час живого тесту `--force-failover` перемикання `eu-north-1b → eu-north-1a` зайняло `166 с` (вилізло за типові `60–120 с`, що вкладається у допустиму вилку `20–600 с`).
+
+### RDS Multi-AZ проти мого стека з #15
+
+У ДЗ #15 база працювала як self-hosted `PostgreSQL` + `PgBouncer` (`pool_mode = transaction`) + `scripts/backup.sh` (`pg_dump -Fc` за cron) + `scripts/restore-drill.sh`.
+- **Що забирає на себе RDS Multi-AZ:** керування основним інстансом і синхронною standby-реплікою в іншій AZ, автоматичний failover з оновленням DNS-ендпоінту, автоматичні щоденні снапшоти та point-in-time recovery (`backupRetentionPeriod: 1`), патчі ОС/рушія та шифрування тому на рівні диска (`storageEncrypted: true`).
+- **Що все одно лишається тобі:** пулінг з'єднань (без `PgBouncer` або RDS Proxy при великій кількості коротких підключень додаток однаково вичерпає `max_connections` на `db.t4g.micro`), міграції схеми, тюнінг індексів/запитів та логічна перевірка відновлення (restore drill на рівні даних і бізнес-інваріантів).
+
+### KMS і сховище секретів (#11)
+
+AWS KMS не замінює сховище секретів із ДЗ #11 (`Infisical` / `scripts/with-secrets.sh`), а працює шаром під ним: KMS захищає кореневий ключ шифрування (наприклад, ключ диска RDS або `ENCRYPTION_KEY`, яким шифруються дані), тоді як сховище секретів керує доставкою прикладних креденшелів (`DB_PASSWORD`, `JWT_PRIVATE_KEY` тощо) у runtime. Власний customer-managed KMS key (CMK) свідомо не створювався, оскільки він додає окремий рядок у білінгу, який не зникає в день `destroy`. Для `storageEncrypted: true` використовується AWS-managed ключ (`aws/rds`).
+
+### Чим бекенд стану відрізняється від #28 і чому
+
+У ДЗ #28 використовувався локальний `file://`-бекенд (`.pulumi`), оскільки кластер `kind` і команди `pulumi up/destroy` запускалися лише з локальної машини. У ДЗ #31 стек `demo` має гарантовано зноситися автоматично через GitHub Actions (`.github/workflows/teardown.yml`), а воркер GitHub не має доступу до локального диска розробника. Тому використовується віддалений бекенд стану (Pulumi Cloud або S3-бекенд в AWS), доступний як локально, так і з CI-раннера.
+
+```
+
 
 
 
