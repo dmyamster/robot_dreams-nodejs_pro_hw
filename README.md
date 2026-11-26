@@ -98,6 +98,94 @@ User 1──1 Account 1──n Position n──1 StockInstrument
 
 ## Запуск
 
+### Схема архітектури
+
+```mermaid
+flowchart LR
+  Client["Client / Swagger / Pact / Tests"] -->|"HTTP + JWT (ES256) + Idempotency-Key"| API["NestJS API<br/>OpenAPI Validator + ProblemExceptionFilter"]
+  API -->|"Controller → Service → Repository"| PG[("PostgreSQL 16<br/>via PgBouncer (transaction mode)")]
+  API -->|"Cache-aside & Rate-limit"| RedisCache[("Redis Cache<br/>allkeys-lru")]
+  API -->|"BullMQ & Sessions"| RedisQueue[("Redis Queue<br/>noeviction + AOF")]
+  API -->|"Transactional Outbox Relay"| RMQ["RabbitMQ<br/>(confirm + DLX/DLQ)"]
+  RMQ -->|"Consumer (ack after effect)"| WS["Realtime<br/>Socket.IO Rooms & SSE"]
+  Client -->|"Presigned PUT/GET"| MinIO["MinIO S3 + Edge CDN"]
+  API -.->|"Pino JSON + OTel + RED Metrics"| Obs["Prometheus + Grafana + Tempo/OTLP"]
+```
+
+- **API-контракт:** [openapi/openapi.yaml](openapi/openapi.yaml) (OpenAPI 3.0.3, `express-openapi-validator`, RFC 7807 `application/problem+json`, cursor-пагінація, `Idempotency-Key`).
+- **Дашборд моніторингу:** [observability/grafana/dashboards/broker-red.json](observability/grafana/dashboards/broker-red.json) (RED-метрики, Prometheus + OTel).
+- **CI/CD та розгортання:** [.github/workflows/ci.yml](.github/workflows/ci.yml) (Quality Gates, Trivy image scan, Pulumi Cost Gate, OIDC Gate, Kind zero-downtime rollout).
+
+### Таблиця блоків (блок → шлях → чим замінено)
+
+| Блок | Статус | Шлях | Реалізація в проєкті | Чим замінено і чому | Доказ / команда перевірки |
+| --- | --- | --- | --- | --- | --- |
+| **11.1 Архітектура та структура рішення** | Реалізовано | Шлях курсу | NestJS модульний моноліт (`Controller → Service → Repository`), `zod` env-валідація, `README.md` (домен, trade-offs, журнал рішень, схема) | Без замін | `npm run check:env`, `npx depcruise --config .dependency-cruiser.cjs src` |
+| **11.2 Основний бізнес-контур та API** | Реалізовано | Шлях курсу | OpenAPI 3.0.3 + `express-openapi-validator` (Варіант Б), `application/problem+json`, `checkout` з транзакційним захистом, ідемпотентність від бізнес-сутності | Без замін | `npm run lint:spec`, `npm run demo:race`, `npm run demo:outbox` |
+| **11.3 Зберігання даних** | Реалізовано | Шлях курсу | PostgreSQL 16 + TypeORM міграції з відкатом, індекси (B-Tree, GIN, partial) + усунення N+1, PgBouncer (`transaction` mode), `restore-drill.sh` (**RTO = 15 с**, **RPO = 24 год**), 2× Redis (`allkeys-lru` / `noeviction`), MinIO presigned + Edge CDN | Без замін | `npm run migrate:revert && npm run migrate`, `npm run demo:nplus1`, `npm run restore:drill`, `npm run demo:cache`, `npm run demo:upload`, `npm run demo:cdn` |
+| **11.4 Безпека та валідація** | Реалізовано | Шлях курсу | Асиметричний JWT (`ES256` з allowlist) + opaque refresh з reuse detection, RBAC + перевірка власності (`401` vs `403`), `express-openapi-validator`, `scripts/with-secrets.sh` (Infisical / локальний fallback поза git/образом), Redis rate-limit (`429` + `Retry-After`) | Без замін | `npm run demo:reuse`, `npm run demo:rbac`, `npm run demo:ratelimit`, `git check-ignore -v .env` |
+| **11.5 Фонова або асинхронна обробка** | Реалізовано | Шлях курсу | RabbitMQ + Transactional Outbox (`FOR UPDATE SKIP LOCKED`), `confirm` + ручний `ack` після ефекту, персистентний дедуп, retry на `40001`/`40P01`, DLQ, BullMQ, Socket.IO кімнати + SSE (`Last-Event-ID`) | Без замін | `npm run demo:crash-write`, `npm run demo:crash-relay`, `npm run demo:duplicate`, `npm run demo:dlq`, `npm run demo:workers`, `node scripts/realtime-demo.mjs` |
+| **11.6 Docker та зовнішній деплой** | Реалізовано | Шлях курсу | `docker-compose.yml` (`--wait`), multi-stage distroless `docker/Dockerfile` + Trivy `npm run scan`, Pulumi + Kind (`maxUnavailable: 0`, PDB, HPA, `SIGTERM` drain), GitHub Actions OIDC + digest promote у Kind | Без замін | `docker compose up -d --wait`, `npm run demo:image`, `npm run demo:rollout`, `npm run demo:pdb`, [.github/workflows/ci.yml](.github/workflows/ci.yml) |
+| **11.7 Спостережуваність, тести та pipeline** | Реалізовано | Шлях курсу | Розділені `/healthz` та `/readyz` (червоніє на `SIGTERM`), Pino JSON-логи з `trace_id` через `AsyncLocalStorage`, Prometheus RED + OTel трейси + Grafana, Testcontainers integration + Supertest e2e + Pact, GitHub Actions CI | Без замін | `npm run demo:logs`, `npm run demo:metrics`, `npm run demo:trace`, `npm run test:integration`, `npm run test:e2e`, `npm run test:contract` |
+
+### Головний наскрізний контур (10 ланок)
+
+1. **API-запит:** клієнт надсилає `POST /api/v1/orders` з `Authorization: Bearer <token>` та `Idempotency-Key`.
+2. **Валідація:** `express-openapi-validator` перевіряє заголовки, тіло та схему за [openapi/openapi.yaml](openapi/openapi.yaml) (при помилці — `400 application/problem+json`).
+3. **Авторизація:** `JwtAuthGuard` (перевірка `ES256` і denylist) та перевірка власності рахунку (`401` / `403`).
+4. **Бізнес-логіка:** атомарне резервування/списання коштів під конкуренцією без oversell і lost update (`src/checkout.ts`).
+5. **Збереження:** замовлення, баланс і подія в `outbox` фіксуються в PostgreSQL в одній транзакції.
+6. **Фонова обробка:** `OutboxRelay` забирає подію (`FOR UPDATE SKIP LOCKED`) → публікує в RabbitMQ → споживач оновлює статус (`FILLED`) і надсилає push у Socket.IO-кімнату / SSE.
+7. **Повторне читання:** `GET /api/v1/orders/:id` повертає оновлений статус ордера.
+8. **Спостережуваність:** кожен шар (`controller → service → repository`) пише структурні логи з одним `trace_id`, експортуються RED-метрики та OTel-трейси.
+9. **Автоматизовані тести:** контур покритий `test:e2e`, `test:integration` (проти реального PostgreSQL) та `test:contract`.
+10. **Розгортання:** сервіс збирається у distroless-образ і розгортається через Pulumi у Kind (включно з CI-прогоном у [.github/workflows/ci.yml](.github/workflows/ci.yml)).
+
+### Єдиний Runbook локального запуску (з чистого клону)
+
+```bash
+# 1. Встановити залежності та перевірити контракт змінних оточення
+npm ci
+npm run check:env
+
+# 2. Підняти всі інфраструктурні сервіси (PostgreSQL, PgBouncer, RabbitMQ, 2x Redis, MinIO, Pact Broker)
+docker compose up -d --wait
+
+# 3. Зібрати застосунок, прогнати міграції та ідемпотентний seed
+npm run build
+npm run migrate
+npm run seed
+
+# 4. Запустити сервіс (секрети підтягуються з Infisical або локального ./secrets fallback)
+npm run start:vault
+```
+
+Перевірка health-проб та базових тестів після запуску:
+
+```bash
+curl -s http://localhost:3000/healthz
+curl -s http://localhost:3000/readyz
+npm run test:integration && npm run test:integration
+npm run test:e2e
+```
+
+> Детальні сценарії та демо-команди для кожного окремого блока наведені нижче у відповідних розділах ДЗ та в секціях `## Grading`.
+
+### OWASP Top 10:2025 (карта безпеки сервісу)
+
+| Категорія OWASP Top 10:2025 | Чи застосовна | Що зроблено в проєкті / чому не робимо |
+| --- | --- | --- |
+| **A01 Broken Access Control** | Так | `JwtAuthGuard` + `RolesGuard` (`INVESTOR` / `ADMIN`), перевірка власності ресурсів (`Account`, `Order`) на рівні сервісу (`401` vs `403`), ізоляція Socket.IO-кімнат по власнику, приватний S3-бакет із presigned URL. |
+| **A02 Security Misconfiguration** | Так | Валідація `env` при старті через `zod` (падіння з `exit ≠ 0`), multi-stage distroless Docker-образ без shell і не від `root`, заборона `synchronize: true` у TypeORM. |
+| **A03 Software Supply Chain Failures** | Так | Зафіксований `package-lock.json`, `npm ci`, SHA-пінування GitHub Actions (`uses: ...@<sha>`), сканування Docker-образу через Trivy з числовим порогом (`npm run scan`). |
+| **A04 Cryptographic Failures** | Так | Підпис JWT асиметричним `ES256` (P-256) з явним allowlist алгоритмів, хешування refresh-токенів із `REFRESH_TOKEN_PEPPER`, секрети поза кодом і поза шарами образу (`scripts/with-secrets.sh`, K8s `Secret`). |
+| **A05 Injection** | Так | Параметризовані запити TypeORM / `pg` без конкатенації SQL, строга валідація входу через `express-openapi-validator` до бізнес-логіки. |
+| **A06 Insecure Design** | Так | Транзакційне блокування ресурсу під конкуренцією (`demo:race`), обов'язковий `Idempotency-Key`, Transactional Outbox із персистентним дедупом, захист від replay/reuse refresh-токенів із відкликанням усієї сім'ї. |
+| **A07 Authentication Failures** | Так | Короткий TTL access-токена (900 с), opaque refresh-токен з одноразовою ротацією та reuse detection, logout через Redis denylist, rate limiting із `429` і `Retry-After`. |
+| **A08 Software or Data Integrity Failures** | Так | Перевірка підписів вебхуків (`timingSafeEqual` над сирим тілом), promote Docker-образу в CI виключно за `@digest`, OIDC-гейт у CI без довгоживучих ключів. |
+| **A09 Security Logging and Monitoring Failures** | Так | Структурні JSON-логи (Pino + `AsyncLocalStorage` `trace_id`) з маскуванням секретів (`secret-in-logs=0`), RED-метрики в Prometheus, OTel-трейси та дашборд у Grafana. |
+| **A10 Mishandling of Exceptional Conditions** | Так | Єдиний глобальний `ProblemExceptionFilter` (`application/problem+json` для 4xx/5xx), цільовий retry лише на `40001`/`40P01`, відправка отруєних повідомлень у DLQ з причиною, коректний `SIGTERM` drain (`readyz` → 503). |
+
 ## ДЗ #9: API Design та Контракт (Варіант Б на NestJS)
 
 Для виконання контрактної частини обрано **Варіант Б (Runtime-валідація на кордоні)**, реалізований на повноцінному **NestJS + TypeScript**:
